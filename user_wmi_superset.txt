@@ -1,0 +1,83 @@
+<#
+User-priv, WMI-only security & system enum.
+Counts ONLY WMI requests. Writes TXT to Desktop.
+#>
+
+$Desktop = [Environment]::GetFolderPath('Desktop')
+$Stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
+$Out     = Join-Path $Desktop "User_WMI_Superset_$Stamp.txt"
+$WmiCnt  = 0
+
+function Invoke-WMI {
+  param([string]$Q,[string]$NS='root\cimv2')
+  $global:WmiCnt++
+  try { Get-WmiObject -Namespace $NS -Query $Q -ErrorAction Stop } catch { $_ }
+}
+
+"USER WMI SUPERSET REPORT" | Out-File $Out -Encoding UTF8
+"Generated: $(Get-Date)"  | Out-File $Out -Append
+
+# Local users
+"`n[LOCAL USERS]" | Out-File $Out -Append
+$u = Invoke-WMI 'SELECT Name, SID, Disabled, LocalAccount, FullName FROM Win32_UserAccount WHERE LocalAccount=True'
+$u | Format-Table Name,FullName,SID,Disabled -Auto | Out-String | Out-File $Out -Append
+
+# Administrators group
+"`n[ADMINISTRATORS GROUP]" | Out-File $Out -Append
+$admins = Invoke-WMI 'SELECT PartComponent FROM Win32_GroupUser WHERE GroupComponent LIKE "%Administrators%"'
+$admins | ForEach-Object { if ($_.PartComponent -match 'Domain="([^"]+)",Name="([^"]+)"'){ "$($Matches[1])\$($Matches[2])" } } |
+  Sort-Object -Unique | Out-File $Out -Append
+
+# AV products (SecurityCenter2)
+"`n[ANTIVIRUS PRODUCTS]" | Out-File $Out -Append
+$av = Invoke-WMI 'SELECT displayName,productState,pathToSignedProductExe FROM AntiVirusProduct' 'root\SecurityCenter2'
+if ($av -isnot [System.Management.Automation.ErrorRecord]) {
+  $av | Format-Table displayName,productState,pathToSignedProductExe -Auto | Out-String | Out-File $Out -Append
+} else { "SecurityCenter2 not available." | Out-File $Out -Append }
+
+# OS / Hardware
+"`n[OS / HARDWARE]" | Out-File $Out -Append
+$os  = Invoke-WMI 'SELECT Caption,Version,BuildNumber,OSArchitecture,LastBootUpTime FROM Win32_OperatingSystem'
+$cs  = Invoke-WMI 'SELECT Manufacturer,Model,NumberOfLogicalProcessors,TotalPhysicalMemory FROM Win32_ComputerSystem'
+$cpu = Invoke-WMI 'SELECT Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed FROM Win32_Processor'
+$bios= Invoke-WMI 'SELECT Manufacturer,SMBIOSBIOSVersion,ReleaseDate FROM Win32_BIOS'
+$os  | Select Caption,Version,BuildNumber,OSArchitecture,LastBootUpTime | Format-List | Out-String | Out-File $Out -Append
+$cs  | Select Manufacturer,Model,NumberOfLogicalProcessors,@{n='RAM_GB';e={[math]::Round($_.TotalPhysicalMemory/1GB,2)}} | Format-List | Out-String | Out-File $Out -Append
+$cpu | Select Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed | Format-Table -Auto | Out-String | Out-File $Out -Append
+$bios| Select Manufacturer,SMBIOSBIOSVersion,ReleaseDate | Format-List | Out-String | Out-File $Out -Append
+
+# Network config (incl. IPs)
+"`n[NETWORK CONFIG]" | Out-File $Out -Append
+$nc = Invoke-WMI 'SELECT Description,MACAddress,IPAddress,DefaultIPGateway,DNSServerSearchOrder FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled=True'
+$nc | ForEach-Object {
+  [pscustomobject]@{
+    Desc   = $_.Description
+    MAC    = $_.MACAddress
+    IPs    = ($_.IPAddress -join ',')
+    GW     = ($_.DefaultIPGateway -join ',')
+    DNS    = ($_.DNSServerSearchOrder -join ',')
+  }
+} | Format-Table -Auto | Out-String | Out-File $Out -Append
+
+# Security services (by name)
+"`n[SECURITY SERVICES (NAME MATCH)]" | Out-File $Out -Append
+$svc = Invoke-WMI 'SELECT Name,DisplayName,State,StartMode FROM Win32_Service'
+$svc | Where-Object { $_.DisplayName -match 'Defender|Antivirus|Security|EDR|CrowdStrike|Carbon Black|Sentinel|Sophos|ESET|Kaspersky|Trend Micro|McAfee' } |
+  Sort-Object DisplayName |
+  Format-Table DisplayName,State,StartMode -Auto | Out-String | Out-File $Out -Append
+
+# Shares (often useful for posture)
+"`n[SMB SHARES]" | Out-File $Out -Append
+$sh = Invoke-WMI 'SELECT Name,Path,Description FROM Win32_Share'
+$sh | Format-Table Name,Path,Description -Auto | Out-String | Out-File $Out -Append
+
+# PowerShell policies via WMI? (No native WMI class for PS policy; note that)
+"`n[POWERSHELL POLICIES]" | Out-File $Out -Append
+"Note: PS execution/logging policies are registry-driven; excluded to keep WMI-only test." | Out-File $Out -Append
+
+# Summary
+"`n--------------------------------------------------" | Out-File $Out -Append
+"Total WMI requests: $WmiCnt" | Out-File $Out -Append
+"Report: $Out" | Out-File $Out -Append
+Write-Host "Report written: $Out" -ForegroundColor Green
+Write-Host "WMI requests: $WmiCnt" -ForegroundColor Cyan
