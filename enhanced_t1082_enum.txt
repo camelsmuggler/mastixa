@@ -1,0 +1,485 @@
+<#
+ps_enum_t1082_enhanced.ps1
+Purpose: Enhanced user-privilege T1082-style enumerator with stealth features.
+ - Only runs actions safe for a normal (non-admin) user.
+ - Counts CIM/WMI calls and heavy operations.
+ - Randomized execution order and jitter for stealth.
+ - Produces a human-readable .txt report on the Desktop.
+
+Usage:
+  powershell -ExecutionPolicy Bypass -File .\ps_enum_t1082_enhanced.ps1
+  
+Options:
+  -StealthMode: Reduces sample sizes and adds delays between operations
+#>
+
+param(
+    [switch]$StealthMode
+)
+
+# ---------- Configuration ----------
+$OutputDir = Join-Path $env:USERPROFILE 'Desktop'
+if (-not (Test-Path $OutputDir)) { $OutputDir = $env:TEMP }
+$Timestamp = (Get-Date -Format "yyyyMMdd_HHmmss")
+$OutFile = Join-Path $OutputDir "sysenum_enhanced_T1082_$Timestamp.txt"
+
+# Stealth settings
+$StealthDelay = if ($StealthMode) { @{Min=500; Max=2000} } else { @{Min=100; Max=500} }
+$SampleSize = if ($StealthMode) { 3 } else { 5 }
+$ThrottleMin = if ($StealthMode) { 4 } else { 6 }
+$ThrottleMax = if ($StealthMode) { 6 } else { 8 }
+
+# ---------- Counters & state ----------
+$CimCallCount = 0
+$HeavyCallCount = 0
+$FunctionResults = [System.Collections.Generic.List[object]]::new()
+$StartTime = Get-Date
+
+# ---------- Helpers ----------
+function Record-Result {
+    param($Label, $Success, $Error, $Count, $Sample)
+    $obj = [pscustomobject]@{
+        Label   = $Label
+        Success = $Success
+        Error   = $Error
+        Count   = $Count
+        Sample  = $Sample
+    }
+    [void]$script:FunctionResults.Add($obj)
+    return $obj
+}
+
+function Invoke-SleepJitter {
+    Start-Sleep -Milliseconds (Get-Random -Minimum $script:StealthDelay.Min -Maximum $script:StealthDelay.Max)
+}
+
+function Run-CimQuery {
+    param([string]$Label, [string]$QueryOrClass, [switch]$IsQuery)
+
+    $throttle = Get-Random -Minimum $script:ThrottleMin -Maximum $script:ThrottleMax
+    $res = [ordered]@{ Label=$Label; Query=$QueryOrClass; Success=$false; Error=$null; Count=0; Sample=@() }
+    try {
+        if ($IsQuery) {
+            $objs = Get-CimInstance -Query $QueryOrClass -ErrorAction Stop -ThrottleLimit $throttle
+        } else {
+            $objs = Get-CimInstance -ClassName $QueryOrClass -ErrorAction Stop -ThrottleLimit $throttle
+        }
+        $script:CimCallCount++
+        if ($null -eq $objs) { $objs = @() }
+        $res.Count = ($objs | Measure-Object).Count
+        $res.Sample = $objs | Select-Object -First $script:SampleSize | ForEach-Object {
+            $_ | Select-Object -Property * -ExcludeProperty __* | ConvertTo-Json -Compress -Depth 2
+        }
+        $res.Success = $true
+    } catch {
+        $res.Error = $_.Exception.Message
+    }
+    [void]$script:FunctionResults.Add([pscustomobject]$res)
+    return $res
+}
+
+function Run-Heavy {
+    param([string]$Label, [scriptblock]$Action)
+    $res = [ordered]@{ Label=$Label; Success=$false; Error=$null; Count=0; Sample=@() }
+    try {
+        $out = & $Action
+        $script:HeavyCallCount++
+        if ($null -eq $out) { $out = @() }
+        $res.Count = ($out | Measure-Object).Count
+        $res.Sample = $out | Select-Object -First $script:SampleSize | ForEach-Object {
+            try { $_ | Select-Object -Property * -ExcludeProperty PS* | ConvertTo-Json -Compress -Depth 2 } catch { $_.ToString() }
+        }
+        $res.Success = $true
+    } catch {
+        $res.Error = $_.Exception.Message
+    }
+    [void]$script:FunctionResults.Add([pscustomobject]$res)
+    return $res
+}
+
+function Test-IsAdmin { 
+    try {
+        $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $p = New-Object System.Security.Principal.WindowsPrincipal($id)
+        return $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+# ---------- Basic System Info ----------
+function Get-BasicSystem {
+    Run-CimQuery -Label 'Get-BasicSystem' -QueryOrClass 'Win32_OperatingSystem'
+}
+
+function Get-ComputerSystem {
+    Run-CimQuery -Label 'Get-ComputerSystem' -QueryOrClass 'Win32_ComputerSystem'
+}
+
+function Get-CPU {
+    Run-CimQuery -Label 'Get-CPU' -QueryOrClass 'Win32_Processor'
+}
+
+function Get-BIOS {
+    Run-CimQuery -Label 'Get-BIOS' -QueryOrClass 'Win32_BIOS'
+}
+
+function Get-TimeZone {
+    Run-CimQuery -Label 'Get-TimeZone' -QueryOrClass 'Win32_TimeZone'
+}
+
+function Get-SystemInfoViaRegistry {
+    Run-Heavy -Label 'Get-SystemInfoViaRegistry' -Action {
+        Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------- Enhanced Discovery ----------
+function Get-DomainInfo {
+    Run-CimQuery -Label 'Get-DomainInfo' -QueryOrClass 'Win32_NTDomain'
+}
+
+function Get-LoggedOnUsers {
+    Run-CimQuery -Label 'Get-LoggedOnUsers' -QueryOrClass 'Win32_LoggedOnUser'
+}
+
+function Get-StartupPrograms {
+    Run-CimQuery -Label 'Get-StartupPrograms' -QueryOrClass 'Win32_StartupCommand'
+}
+
+function Get-ScheduledTasks {
+    Run-Heavy -Label 'Get-ScheduledTasks' -Action { 
+        Get-ScheduledTask -ErrorAction SilentlyContinue | 
+        Where-Object {$_.State -ne 'Disabled'} | 
+        Select-Object TaskName,TaskPath,State -First 50
+    }
+}
+
+# ---------- Storage & File System ----------
+function Get-DiskInfo {
+    Run-CimQuery -Label 'Get-DiskInfo' -QueryOrClass 'Win32_LogicalDisk'
+}
+
+function Get-MountedDevices {
+    Run-CimQuery -Label 'Get-MountedDevices' -QueryOrClass 'Win32_Volume'
+}
+
+function Get-USBDevices {
+    Run-CimQuery -Label 'Get-USBDevices' -QueryOrClass 'SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE "USB%"' -IsQuery
+}
+
+function Get-RecentFiles {
+    Run-Heavy -Label 'Get-RecentFiles' -Action {
+        Get-ChildItem "$env:APPDATA\Microsoft\Windows\Recent" -File -ErrorAction SilentlyContinue | 
+        Select-Object Name,LastWriteTime -First 20
+    }
+}
+
+# ---------- Network Intelligence ----------
+function Get-NetworkConfig {
+    Run-CimQuery -Label 'Get-NetworkConfig' -QueryOrClass 'Win32_NetworkAdapterConfiguration'
+}
+
+function Get-IPConfig {
+    Run-Heavy -Label 'Get-IPConfig' -Action { 
+        Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
+        Where-Object {$_.IPAddress -and -not $_.IPAddress.StartsWith('169.254')} 
+    }
+}
+
+function Get-DNSCache {
+    Run-Heavy -Label 'Get-DNSCache' -Action { 
+        Get-DnsClientCache -ErrorAction SilentlyContinue | Select-Object Entry,Data -First 50
+    }
+}
+
+function Get-NetworkRoutes {
+    Run-Heavy -Label 'Get-NetworkRoutes' -Action {
+        Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
+        Select-Object DestinationPrefix,NextHop,RouteMetric -First 30
+    }
+}
+
+function Get-FirewallRules {
+    Run-Heavy -Label 'Get-FirewallRules' -Action {
+        Get-NetFirewallRule -Enabled True -ErrorAction SilentlyContinue | 
+        Select-Object DisplayName,Direction,Action -First 50
+    }
+}
+
+function Get-ProxySettings {
+    Run-Heavy -Label 'Get-ProxySettings' -Action {
+        Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue |
+        Select-Object ProxyEnable,ProxyServer,ProxyOverride
+    }
+}
+
+function Get-NetBiosInterface {
+    Run-CimQuery -Label 'Get-NetBiosInterface' -QueryOrClass 'SELECT Description,IPAddress,MACAddress,DNSHostName FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled=True' -IsQuery
+}
+
+function Get-OxidBinding {
+    Run-CimQuery -Label 'Get-OxidBinding' -QueryOrClass 'Win32_NetworkAdapter'
+}
+
+# ---------- Software & Configuration ----------
+function Get-EnvironmentVariables {
+    Run-Heavy -Label 'Get-EnvironmentVariables' -Action {
+        Get-ChildItem Env: | Select-Object Name,Value
+    }
+}
+
+function Get-InstalledHotfixes {
+    Run-CimQuery -Label 'Get-InstalledHotfixes' -QueryOrClass 'Win32_QuickFixEngineering'
+}
+
+function Get-InstalledPrograms {
+    Run-Heavy -Label 'Get-InstalledPrograms' -Action {
+        $list = @()
+        $hkcu='HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+        if (Test-Path $hkcu) { 
+            $list += Get-ChildItem $hkcu -ErrorAction SilentlyContinue | 
+                     ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+                     Where-Object DisplayName | Select-Object DisplayName,DisplayVersion,Publisher
+        }
+        $hklm='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+        if (Test-Path $hklm) { 
+            $list += Get-ChildItem $hklm -ErrorAction SilentlyContinue | 
+                     ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+                     Where-Object DisplayName | Select-Object DisplayName,DisplayVersion,Publisher -First 50
+        }
+        $list
+    }
+}
+
+function Get-BrowserExtensions {
+    Run-Heavy -Label 'Get-BrowserExtensions' -Action {
+        $extensions = @()
+        $chromePath = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Extensions"
+        if (Test-Path $chromePath) {
+            $extensions += Get-ChildItem $chromePath -Directory -ErrorAction SilentlyContinue | 
+                          Select-Object Name -First 20
+        }
+        $edgePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Extensions"
+        if (Test-Path $edgePath) {
+            $extensions += Get-ChildItem $edgePath -Directory -ErrorAction SilentlyContinue | 
+                          Select-Object Name -First 20
+        }
+        $extensions
+    }
+}
+
+function Get-SavedWifiNetworks {
+    Run-Heavy -Label 'Get-SavedWifiNetworks' -Action {
+        $profiles = (netsh wlan show profiles 2>&1) -match '\s{2,}:\s'
+        $profiles | ForEach-Object { 
+            $name = ($_ -split ':')[1].Trim()
+            [PSCustomObject]@{ProfileName=$name}
+        }
+    }
+}
+
+function Get-PowerConfig {
+    Run-Heavy -Label 'Get-PowerConfig' -Action { 
+        powercfg /list 2>&1 | Select-Object -First 20
+    }
+}
+
+# ---------- Security Posture ----------
+function Get-SecurityService {
+    try {
+        $script:CimCallCount++
+        $av = Get-CimInstance -Namespace "root\SecurityCenter2" -ClassName "AntiVirusProduct" -ErrorAction Stop
+        $res = [pscustomobject]@{ 
+            Label='Get-SecurityService'; 
+            Success=$true; 
+            Error=$null; 
+            Count=($av|Measure-Object).Count; 
+            Sample=($av|Select-Object -First $script:SampleSize|ForEach-Object{$_|ConvertTo-Json -Compress -Depth 2}) 
+        }
+        [void]$script:FunctionResults.Add($res)
+        return $res
+    } catch {
+        return Run-CimQuery -Label 'Get-SecurityService (fallback)' -QueryOrClass 'SELECT Name,DisplayName,State FROM Win32_Service WHERE DisplayName LIKE "%Defender%" OR DisplayName LIKE "%Antivirus%"' -IsQuery
+    }
+}
+
+function Get-UACSetting {
+    Run-Heavy -Label 'Get-UACSetting' -Action {
+        Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue |
+        Select-Object EnableLUA,ConsentPromptBehaviorAdmin
+    }
+}
+
+function Get-BitLockerStatus {
+    Run-Heavy -Label 'Get-BitLockerStatus' -Action {
+        if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+            Get-BitLockerVolume -ErrorAction SilentlyContinue | 
+            Select-Object MountPoint,ProtectionStatus,EncryptionPercentage
+        }
+    }
+}
+
+function Get-WindowsDefenderStatus {
+    Run-Heavy -Label 'Get-WindowsDefenderStatus' -Action {
+        if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
+            Get-MpComputerStatus -ErrorAction SilentlyContinue | 
+            Select-Object AntivirusEnabled,RealTimeProtectionEnabled,IoavProtectionEnabled
+        }
+    }
+}
+
+# ---------- Services & Processes ----------
+function Get-ServiceNamedPipe {
+    Run-CimQuery -Label 'Get-ServiceNamedPipe' -QueryOrClass 'SELECT Name,DisplayName,State,StartMode FROM Win32_Service' -IsQuery
+}
+
+function Get-Processes {
+    Run-CimQuery -Label 'Get-Processes' -QueryOrClass 'Win32_Process'
+}
+
+function Get-SpoolerStatus {
+    Run-CimQuery -Label 'Get-SpoolerStatus' -QueryOrClass 'SELECT Name,State,StartMode FROM Win32_Service WHERE Name LIKE "%spool%"' -IsQuery
+}
+
+# ---------- Users & Shares ----------
+function Get-LocalUsers {
+    Run-CimQuery -Label 'Get-LocalUsers' -QueryOrClass 'Win32_UserAccount'
+}
+
+function Get-Shares {
+    Run-CimQuery -Label 'Get-Shares' -QueryOrClass 'Win32_Share'
+}
+
+# ---------- SMB ----------
+function Get-SmbOSVersion {
+    if (Get-Command Get-SmbClientConfiguration -ErrorAction SilentlyContinue) {
+        Run-Heavy -Label 'Get-SmbOSVersion' -Action { Get-SmbClientConfiguration -ErrorAction Stop }
+    } else {
+        Run-Heavy -Label 'Get-SmbOSVersion' -Action { cmd /c "net config workstation" 2>&1 }
+    }
+}
+
+function Get-SmbStatus {
+    if (Get-Command Get-SmbConnection -ErrorAction SilentlyContinue) {
+        Run-Heavy -Label 'Get-SmbStatus' -Action { Get-SmbConnection -ErrorAction Stop }
+    } else {
+        Run-Heavy -Label 'Get-SmbStatus' -Action { netstat -an | Select-String ':445' }
+    }
+}
+
+# ---------- Functions skipped (admin-only) ----------
+$SkippedFunctions = @(
+    'Get-CimDpapiBrowser','Get-CimDpapiCredential','Get-CimDpapiVault','Get-CimDpapiWifi',
+    'Get-CimUnprotectedCredential','Get-RegistryHiveDump','Get-ShadowHiveDump',
+    'Get-EventLogon','Get-EventSuspiciousBITS','Get-EventSuspiciousPS','Get-EventSvcCreation',
+    'Get-EventSvcModification','Get-EventTaskCreation','Get-EventTaskModification'
+)
+
+# ---------- Function list to run ----------
+$FunctionsToRun = @(
+    # Basic System
+    'Get-BasicSystem','Get-ComputerSystem','Get-CPU','Get-BIOS','Get-TimeZone','Get-SystemInfoViaRegistry',
+    # Enhanced Discovery
+    'Get-DomainInfo','Get-LoggedOnUsers','Get-StartupPrograms','Get-ScheduledTasks',
+    # Storage & File System
+    'Get-DiskInfo','Get-MountedDevices','Get-USBDevices','Get-RecentFiles',
+    # Network Intelligence
+    'Get-NetworkConfig','Get-IPConfig','Get-DNSCache','Get-NetworkRoutes','Get-FirewallRules',
+    'Get-ProxySettings','Get-NetBiosInterface','Get-OxidBinding',
+    # Software & Configuration
+    'Get-EnvironmentVariables','Get-InstalledHotfixes','Get-InstalledPrograms','Get-BrowserExtensions',
+    'Get-SavedWifiNetworks','Get-PowerConfig',
+    # Security Posture
+    'Get-SecurityService','Get-UACSetting','Get-BitLockerStatus','Get-WindowsDefenderStatus',
+    # Services & Processes
+    'Get-ServiceNamedPipe','Get-Processes','Get-SpoolerStatus',
+    # Users & Shares
+    'Get-LocalUsers','Get-Shares',
+    # SMB
+    'Get-SmbOSVersion','Get-SmbStatus'
+)
+
+# Randomize execution order for stealth
+$FunctionsToRun = $FunctionsToRun | Get-Random -Count $FunctionsToRun.Count
+
+# ---------- Run enumeration ----------
+Write-Host "=== Enhanced T1082 User-Level Enumeration ===" -ForegroundColor Cyan
+Write-Host "Stealth Mode: $StealthMode" -ForegroundColor $(if($StealthMode){'Yellow'}else{'Green'})
+Write-Host "Running $($FunctionsToRun.Count) functions. Admin: $(Test-IsAdmin)" -ForegroundColor Cyan
+Write-Host ""
+
+foreach ($fn in $FunctionsToRun) {
+    Write-Host "==> Running $fn" -ForegroundColor Green
+    try {
+        & (Get-Command $fn -ErrorAction Stop)
+    } catch {
+        Record-Result $fn $false $_.Exception.Message 0 @()
+    }
+    Invoke-SleepJitter
+}
+
+# Mark skipped admin-only functions
+foreach ($sk in $SkippedFunctions) {
+    Record-Result $sk $false 'Skipped: requires Administrator privileges' 0 @()
+}
+
+$EndTime = Get-Date
+$Duration = ($EndTime - $StartTime).TotalSeconds
+
+# ---------- Build report ----------
+$sb = New-Object System.Text.StringBuilder
+$sb.AppendLine("=" * 80) | Out-Null
+$sb.AppendLine("Enhanced User-Level T1082 Enumeration Report") | Out-Null
+$sb.AppendLine("=" * 80) | Out-Null
+$sb.AppendLine("Generated: $((Get-Date).ToString('u'))") | Out-Null
+$sb.AppendLine("Host: $env:COMPUTERNAME    User: $env:USERNAME    Admin: $(Test-IsAdmin)") | Out-Null
+$sb.AppendLine("Stealth Mode: $StealthMode") | Out-Null
+$sb.AppendLine("Duration: $([math]::Round($Duration, 2)) seconds") | Out-Null
+$sb.AppendLine("") | Out-Null
+
+$sb.AppendLine("SUMMARY METRICS:") | Out-Null
+$sb.AppendLine("-" * 80) | Out-Null
+$sb.AppendLine("  CIM/WMI calls executed: $CimCallCount") | Out-Null
+$sb.AppendLine("  Heavy (non-CIM) ops executed: $HeavyCallCount") | Out-Null
+$sb.AppendLine("  Total operations: $($CimCallCount + $HeavyCallCount)") | Out-Null
+$successCount = ($FunctionResults | Where-Object {$_.Success -eq $true} | Measure-Object).Count
+$sb.AppendLine("  Successful operations: $successCount / $($FunctionResults.Count)") | Out-Null
+$sb.AppendLine("") | Out-Null
+
+$sb.AppendLine("PER-FUNCTION DETAILS:") | Out-Null
+$sb.AppendLine("-" * 80) | Out-Null
+foreach ($r in $FunctionResults) {
+    $sb.AppendLine("[$($r.Label)]") | Out-Null
+    $sb.AppendLine("  Success: $($r.Success)   Count: $($r.Count)") | Out-Null
+    if ($r.Error) { $sb.AppendLine("  Error: $($r.Error)") | Out-Null }
+    if ($r.Sample -and $r.Sample.Count -gt 0) {
+        $sb.AppendLine("  Sample (up to $SampleSize items):") | Out-Null
+        foreach ($s in $r.Sample) { $sb.AppendLine("    $s") | Out-Null }
+    }
+    $sb.AppendLine("") | Out-Null
+}
+
+$sb.AppendLine("SKIPPED (admin-only) FUNCTIONS:") | Out-Null
+$sb.AppendLine("-" * 80) | Out-Null
+foreach ($sk in $SkippedFunctions) { $sb.AppendLine("  - $sk (requires Administrator)") | Out-Null }
+$sb.AppendLine("") | Out-Null
+
+$sb.AppendLine("ENVIRONMENT SNAPSHOT:") | Out-Null
+$sb.AppendLine("-" * 80) | Out-Null
+$sb.AppendLine("  Timestamp: $((Get-Date).ToString('u'))") | Out-Null
+$sb.AppendLine("  Hostname: $env:COMPUTERNAME") | Out-Null
+$sb.AppendLine("  Username: $env:USERNAME") | Out-Null
+$sb.AppendLine("  Domain: $env:USERDOMAIN") | Out-Null
+$sb.AppendLine("  PowerShell: $($PSVersionTable.PSVersion)") | Out-Null
+$ips = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -and -not $_.IPAddress.StartsWith('169.254') } | Select-Object -ExpandProperty IPAddress) -join ', '
+$sb.AppendLine("  IPs: $ips") | Out-Null
+$sb.AppendLine("=" * 80) | Out-Null
+
+# Write file
+$sb.ToString() | Out-File -FilePath $OutFile -Encoding UTF8
+
+Write-Host ""
+Write-Host "=" * 80 -ForegroundColor Cyan
+Write-Host "Report written to: $OutFile" -ForegroundColor Green
+Write-Host "CIM/WMI calls: $CimCallCount   Heavy ops: $HeavyCallCount" -ForegroundColor Yellow
+Write-Host "Duration: $([math]::Round($Duration, 2)) seconds" -ForegroundColor Yellow
+Write-Host "=" * 80 -ForegroundColor Cyan
