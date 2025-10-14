@@ -1,7 +1,8 @@
 #requires -version 3
 <#
 User-level comprehensive system audit (Seatbelt-like)
-Outputs text + JSON in current directory. Counts one request per check.
+Windows PowerShell 3+ compatible (no ternary, no null-conditional).
+Outputs text + JSON. Counts one request per check.
 #>
 
 param(
@@ -93,9 +94,11 @@ Run-Check 'ARPTable' {
 Run-Check 'AuditPolicies' {
   $tmp = Join-Path $env:TEMP "secpol_$ts.txt"
   secedit /export /cfg $tmp 2>$null | Out-Null
-  $classic = (Test-Path $tmp) ? (Get-Content $tmp) : 'secedit export failed'
-  $adv = (Get-Command Get-AuditPolicy -ErrorAction SilentlyContinue) ? (Get-AuditPolicy -Category * ) : 'Get-AuditPolicy unavailable'
+  $classic = $null
+  if (Test-Path $tmp) { $classic = Get-Content $tmp } else { $classic = 'secedit export failed' }
   Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+  $adv = $null
+  if (Get-Command Get-AuditPolicy -ErrorAction SilentlyContinue) { $adv = Get-AuditPolicy -Category * } else { $adv = 'Get-AuditPolicy unavailable' }
   [pscustomobject]@{ Classic=$classic; Advanced=$adv }
 }
 
@@ -113,10 +116,14 @@ Run-Check 'AutoRuns' {
              'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
              'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce',
              'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
-  $runs = foreach ($k in $runKeys) {
-    if (Test-Path $k) { [pscustomobject]@{ Registry=$k; Items=(Get-ItemProperty $k | Select-Object * -ExcludeProperty PS*) } }
+  $runs = @()
+  foreach ($k in $runKeys) {
+    if (Test-Path $k) {
+      $runs += [pscustomobject]@{ Registry=$k; Items=(Get-ItemProperty $k | Select-Object * -ExcludeProperty PS*) }
+    }
   }
-  $tasks = try { schtasks /Query /FO CSV /V 2>$null | ConvertFrom-Csv } catch { @() }
+  $tasks = @()
+  try { $tasks = schtasks /Query /FO CSV /V 2>$null | ConvertFrom-Csv } catch {}
   $autoServices = Get-Service | Where-Object StartType -eq 'Automatic' | Select-Object Name,DisplayName,Status
   [pscustomobject]@{ RegistryRunKeys=$runs; ScheduledTasks=$tasks; AutoServices=$autoServices }
 }
@@ -148,9 +155,13 @@ Run-Check 'DNSCache' {
 }
 
 Run-Check 'DotNet' {
-  $fw = try { Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP' -Recurse |
-               Get-ItemProperty -Name Version,Release -ErrorAction SilentlyContinue | Select-Object PSPath,Version,Release } catch { @() }
-  $cli = try { & dotnet --list-runtimes 2>$null } catch { 'dotnet CLI not present' }
+  $fw = @()
+  try {
+    $fw = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP' -Recurse |
+          Get-ItemProperty -Name Version,Release -ErrorAction SilentlyContinue | Select-Object PSPath,Version,Release
+  } catch {}
+  $cli = $null
+  try { $cli = (& dotnet --list-runtimes 2>$null) } catch { $cli = 'dotnet CLI not present' }
   [pscustomobject]@{ RegistryFramework=$fw; DotnetCLI=$cli }
 }
 
@@ -215,7 +226,7 @@ Run-Check 'LocalGroups' {
     }
   } catch {
     $lg = [ADSI]"WinNT://$env:COMPUTERNAME"
-    $lg.Children | Where-Object SchemaClassName -eq 'Group' | ForEach-Object {
+    $lg.Children | Where-Object { $_.SchemaClassName -eq 'Group' } | ForEach-Object {
       $m=@(); try { $m = $_.Invoke('Members') | ForEach-Object { $_.GetType().InvokeMember('Name','GetProperty',$null,$_,$null) } } catch {}
       if ($m.Count -gt 0 -or $Full) { [pscustomobject]@{ Group=$_.Name; Members=$m } }
     }
@@ -226,7 +237,7 @@ Run-Check 'LocalUsers' {
   try { Get-LocalUser | Select-Object Name,Enabled,LastPasswordSet }
   catch {
     $u=[ADSI]"WinNT://$env:COMPUTERNAME"
-    $u.Children | Where-Object SchemaClassName -eq 'User' | ForEach-Object {
+    $u.Children | Where-Object { $_.SchemaClassName -eq 'User' } | ForEach-Object {
       [pscustomobject]@{ Name=$_.Name; Disabled=$_.AccountDisabled; PasswordAge=$_.PasswordAge }
     }
   }
@@ -242,11 +253,11 @@ Run-Check 'LSASettings' {
 }
 
 Run-Check 'McAfeeConfigs' {
-  $paths = 'C:\ProgramData\McAfee','C:\Program Files\McAfee',$env:ProgramFiles+'\McAfee'
+  $paths = 'C:\ProgramData\McAfee','C:\Program Files\McAfee',("$env:ProgramFiles\McAfee")
   foreach ($p in $paths) {
     if (Test-Path $p) {
       Get-ChildItem -Path $p -Recurse -ErrorAction SilentlyContinue |
-        Where-Object Name -match 'SiteList|Config|mcinfo|xml' |
+        Where-Object { $_.Name -match 'SiteList|Config|mcinfo|xml' } |
         Select-Object FullName,LastWriteTime -First 50
     }
   }
@@ -321,7 +332,12 @@ Run-Check 'SCCM' {
 Run-Check 'Services' {
   Get-WmiObject Win32_Service | ForEach-Object {
     $company=$null
-    if ($_.PathName) { try { $company=(Get-Item $_.PathName.Split('"')[-1]).VersionInfo.CompanyName } catch {} }
+    if ($_.PathName) {
+      $bin = $_.PathName
+      # strip quotes/params
+      if ($bin.StartsWith('"')) { $bin = $bin.Split('"')[1] } else { $bin = $bin.Split(' ')[0] }
+      try { $company=(Get-Item $bin).VersionInfo.CompanyName } catch {}
+    }
     if ($Full -or ($company -and $company -notlike '*Microsoft*') -or ($_.PathName -and $_.PathName -notmatch 'Windows\\System32')) {
       [pscustomobject]@{ Name=$_.Name; DisplayName=$_.DisplayName; State=$_.State; StartMode=$_.StartMode; PathName=$_.PathName; Company=$company }
     }
@@ -339,12 +355,16 @@ Run-Check 'Sysmon' {
 Run-Check 'TcpConnections' {
   try {
     Get-NetTCPConnection | ForEach-Object {
-      $p = try { Get-Process -Id $_.OwningProcess -ErrorAction Stop } catch { $null }
+      $pname = $null
+      try {
+        $pobj = Get-Process -Id $_.OwningProcess -ErrorAction Stop
+        $pname = $pobj.ProcessName
+      } catch {}
       [pscustomobject]@{
         Local="$($_.LocalAddress):$($_.LocalPort)"
         Remote="$($_.RemoteAddress):$($_.RemotePort)"
         State=$_.State
-        Process=($p?.ProcessName)
+        Process=$pname
         PID=$_.OwningProcess
       }
     }
@@ -360,8 +380,12 @@ Run-Check 'UAC' {
 Run-Check 'UdpConnections' {
   try {
     Get-NetUDPEndpoint | ForEach-Object {
-      $p = try { Get-Process -Id $_.OwningProcess -ErrorAction Stop } catch { $null }
-      [pscustomobject]@{ Local="$($_.LocalAddress):$($_.LocalPort)"; Process=($p?.ProcessName); PID=$_.OwningProcess }
+      $pname = $null
+      try {
+        $pobj = Get-Process -Id $_.OwningProcess -ErrorAction Stop
+        $pname = $pobj.ProcessName
+      } catch {}
+      [pscustomobject]@{ Local="$($_.LocalAddress):$($_.LocalPort)"; Process=$pname; PID=$_.OwningProcess }
     }
   } catch { 'Get-NetUDPEndpoint unavailable' }
 }
@@ -506,7 +530,7 @@ Run-Check 'user.IEUrls' {
   } else { 'TypedURLs key missing' }
 }
 
-Run-Check 'user.MappedDrives' { Get-PSDrive -PSProvider FileSystem | Where-Object DisplayRoot | Select-Object Name,DisplayRoot }
+Run-Check 'user.MappedDrives' { Get-PSDrive -PSProvider FileSystem | Where-Object { $_.DisplayRoot } | Select-Object Name,DisplayRoot }
 
 Run-Check 'user.OfficeMRUs' {
   foreach ($p in "$env:APPDATA\Microsoft\Office\Recent","$env:LOCALAPPDATA\Microsoft\Office\Recent") {
@@ -538,7 +562,7 @@ Run-Check 'user.SlackPresence' { Test-Path "$env:APPDATA\Slack" }
 
 Run-Check 'user.SlackDownloads' {
   $p="$env:APPDATA\Slack"
-  if (Test-Path $p) { Get-ChildItem -Path $p -Recurse -ErrorAction SilentlyContinue | Where-Object Name -match 'slack-downloads' | Select-Object FullName -First 20 } else { 'Slack not present' }
+  if (Test-Path $p) { Get-ChildItem -Path $p -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'slack-downloads' } | Select-Object FullName -First 20 } else { 'Slack not present' }
 }
 
 Run-Check 'user.TokenGroups' {
@@ -556,10 +580,16 @@ Run-Check 'user.WindowsVault' { try { cmdkey /list 2>$null } catch { 'cmdkey una
 # ---------------- MISC GROUP ----------------
 
 Run-Check 'misc.ChromiumBookmarks' {
+  $out=@()
   foreach ($p in "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Bookmarks",
                  "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Bookmarks") {
-    if (Test-Path $p) { [pscustomobject]@{ Path=$p; First200=(Get-Content $p -ErrorAction SilentlyContinue | Select-Object -First 200) } else { "$p Missing" }
+    if (Test-Path $p) {
+      $out += [pscustomobject]@{ Path=$p; First200=(Get-Content $p -ErrorAction SilentlyContinue | Select-Object -First 200) }
+    } else {
+      $out += [pscustomobject]@{ Path=$p; First200='Missing' }
+    }
   }
+  $out
 }
 
 Run-Check 'misc.ChromiumHistory' {
@@ -577,7 +607,7 @@ Run-Check 'misc.ExplicitLogonEvents' {
 Run-Check 'misc.InstalledProducts' {
   foreach ($path in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
                    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') {
-    Get-ItemProperty $path -ErrorAction SilentlyContinue | Where-Object DisplayName |
+    Get-ItemProperty $path -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } |
       Select-Object DisplayName,DisplayVersion,Publisher,InstallDate
   }
 }
@@ -634,7 +664,8 @@ Run-Check 'misc.RecycleBin' {
 }
 
 Run-Check 'misc.reg' {
-  Get-ChildItem -Path 'HKLM:\Software' -Recurse -Depth 1 -ErrorAction SilentlyContinue | Select-Object -First 200 PSPath
+  # No -Depth in PSv3; simple first 200 keys under HKLM:\Software
+  Get-ChildItem -Path 'HKLM:\Software' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 200 PSPath
 }
 
 Run-Check 'misc.RPCMappedEndpoints' { 'RPC endpoint mapping via WMI disabled on many hosts; skipping' }
