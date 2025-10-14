@@ -1,0 +1,679 @@
+#requires -version 3
+
+<#
+.SYNOPSIS
+    System enumeration script for security assessment
+.DESCRIPTION
+    Performs comprehensive system enumeration similar to Seatbelt
+.NOTES
+    Run with appropriate permissions. Some checks require elevation.
+#>
+
+param(
+    [string]$OutputPath = ".",
+    [switch]$Full
+)
+
+$ErrorActionPreference = "SilentlyContinue"
+$script:RequestCount = 0
+$OutputFile = Join-Path $OutputPath "SystemEnum_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+
+function Write-Output-And-File {
+    param([string]$Message)
+    Write-Host $Message
+    Add-Content -Path $OutputFile -Value $Message
+    $script:RequestCount++
+}
+
+function Get-Banner {
+    $banner = @"
+====================================
+  System Enumeration Script
+  Started: $(Get-Date)
+====================================
+"@
+    Write-Output-And-File $banner
+}
+
+#region System Group
+
+function Get-AMSIProviders {
+    Write-Output-And-File "`n[*] AMSI Providers"
+    Write-Output-And-File "=" * 50
+    $amsiPath = "HKLM:\SOFTWARE\Microsoft\AMSI\Providers"
+    if (Test-Path $amsiPath) {
+        Get-ChildItem $amsiPath | ForEach-Object {
+            Write-Output-And-File "Provider: $($_.PSChildName)"
+        }
+    }
+}
+
+function Get-AntiVirus {
+    Write-Output-And-File "`n[*] AntiVirus Products"
+    Write-Output-And-File "=" * 50
+    Get-WmiObject -Namespace "root\SecurityCenter2" -Class AntiVirusProduct | ForEach-Object {
+        Write-Output-And-File "Name: $($_.displayName)"
+        Write-Output-And-File "State: $($_.productState)"
+        Write-Output-And-File "Path: $($_.pathToSignedProductExe)"
+    }
+}
+
+function Get-AppLockerPolicy {
+    Write-Output-And-File "`n[*] AppLocker Policy"
+    Write-Output-And-File "=" * 50
+    $appLockerPolicy = Get-AppLockerPolicy -Effective -ErrorAction SilentlyContinue
+    if ($appLockerPolicy) {
+        $appLockerPolicy.RuleCollections | ForEach-Object {
+            Write-Output-And-File "Rule Collection: $($_.RuleCollectionType)"
+            $_.Rules | ForEach-Object {
+                Write-Output-And-File "  Rule: $($_.Name) - Action: $($_.Action)"
+            }
+        }
+    } else {
+        Write-Output-And-File "AppLocker not configured or not accessible"
+    }
+}
+
+function Get-ARPTable {
+    Write-Output-And-File "`n[*] ARP Table"
+    Write-Output-And-File "=" * 50
+    Get-NetNeighbor | ForEach-Object {
+        Write-Output-And-File "Interface: $($_.InterfaceAlias) | IP: $($_.IPAddress) | MAC: $($_.LinkLayerAddress) | State: $($_.State)"
+    }
+}
+
+function Get-AuditPolicies {
+    Write-Output-And-File "`n[*] Audit Policies"
+    Write-Output-And-File "=" * 50
+    $auditPol = auditpol /get /category:* 2>&1
+    $auditPol | ForEach-Object { Write-Output-And-File $_ }
+}
+
+function Get-AutoRuns {
+    Write-Output-And-File "`n[*] AutoRun Entries"
+    Write-Output-And-File "=" * 50
+    
+    $autoRunPaths = @(
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+    )
+    
+    foreach ($path in $autoRunPaths) {
+        if (Test-Path $path) {
+            Write-Output-And-File "`nRegistry: $path"
+            Get-ItemProperty $path | ForEach-Object {
+                $_.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" } | ForEach-Object {
+                    Write-Output-And-File "  $($_.Name): $($_.Value)"
+                }
+            }
+        }
+    }
+    
+    # Startup folders
+    $startupPaths = @(
+        "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup",
+        "$env:AppData\Microsoft\Windows\Start Menu\Programs\Startup"
+    )
+    
+    foreach ($path in $startupPaths) {
+        if (Test-Path $path) {
+            Write-Output-And-File "`nStartup Folder: $path"
+            Get-ChildItem $path | ForEach-Object {
+                Write-Output-And-File "  $($_.Name)"
+            }
+        }
+    }
+}
+
+function Get-Certificates {
+    Write-Output-And-File "`n[*] Personal Certificates"
+    Write-Output-And-File "=" * 50
+    
+    @("CurrentUser", "LocalMachine") | ForEach-Object {
+        $store = $_
+        Get-ChildItem "Cert:\$store\My" | ForEach-Object {
+            Write-Output-And-File "Store: $store"
+            Write-Output-And-File "  Subject: $($_.Subject)"
+            Write-Output-And-File "  Issuer: $($_.Issuer)"
+            Write-Output-And-File "  Thumbprint: $($_.Thumbprint)"
+            Write-Output-And-File "  NotAfter: $($_.NotAfter)"
+        }
+    }
+}
+
+function Get-CredGuard {
+    Write-Output-And-File "`n[*] Credential Guard Configuration"
+    Write-Output-And-File "=" * 50
+    $credGuardPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+    if (Test-Path $credGuardPath) {
+        $lsaConfig = Get-ItemProperty $credGuardPath
+        Write-Output-And-File "LsaCfgFlags: $($lsaConfig.LsaCfgFlags)"
+        Write-Output-And-File "RunAsPPL: $($lsaConfig.RunAsPPL)"
+    }
+}
+
+function Get-DNSCache {
+    Write-Output-And-File "`n[*] DNS Cache"
+    Write-Output-And-File "=" * 50
+    Get-DnsClientCache | ForEach-Object {
+        Write-Output-And-File "Entry: $($_.Entry) | Type: $($_.Type) | Data: $($_.Data)"
+    }
+}
+
+function Get-DotNetVersions {
+    Write-Output-And-File "`n[*] .NET Versions"
+    Write-Output-And-File "=" * 50
+    $dotnetPath = "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP"
+    if (Test-Path $dotnetPath) {
+        Get-ChildItem $dotnetPath -Recurse | Get-ItemProperty -Name Version -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Output-And-File "Version: $($_.Version)"
+        }
+    }
+}
+
+function Get-EnvironmentPath {
+    Write-Output-And-File "`n[*] Environment PATH"
+    Write-Output-And-File "=" * 50
+    $env:Path -split ';' | ForEach-Object {
+        Write-Output-And-File $_
+    }
+}
+
+function Get-EnvironmentVariables {
+    Write-Output-And-File "`n[*] Environment Variables"
+    Write-Output-And-File "=" * 50
+    Get-ChildItem Env: | ForEach-Object {
+        Write-Output-And-File "$($_.Name) = $($_.Value)"
+    }
+}
+
+function Get-Hotfixes {
+    Write-Output-And-File "`n[*] Installed Hotfixes"
+    Write-Output-And-File "=" * 50
+    Get-HotFix | ForEach-Object {
+        Write-Output-And-File "HotFixID: $($_.HotFixID) | Description: $($_.Description) | InstalledOn: $($_.InstalledOn)"
+    }
+}
+
+function Get-InterestingProcesses {
+    Write-Output-And-File "`n[*] Interesting Processes"
+    Write-Output-And-File "=" * 50
+    
+    $interestingNames = @("defender", "malware", "sophos", "crowdstrike", "carbon", "cylance", 
+                          "sentinel", "edr", "antivirus", "avg", "avast", "kaspersky", "mcafee",
+                          "symantec", "norton", "wireshark", "fiddler", "processhacker", "procexp")
+    
+    Get-Process | Where-Object {
+        $processName = $_.ProcessName.ToLower()
+        $interestingNames | Where-Object { $processName -like "*$_*" }
+    } | ForEach-Object {
+        Write-Output-And-File "Process: $($_.ProcessName) | PID: $($_.Id) | Path: $($_.Path)"
+    }
+}
+
+function Get-InternetSettings {
+    Write-Output-And-File "`n[*] Internet Settings"
+    Write-Output-And-File "=" * 50
+    $iePath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    if (Test-Path $iePath) {
+        Get-ItemProperty $iePath | ForEach-Object {
+            $_.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" } | ForEach-Object {
+                Write-Output-And-File "$($_.Name): $($_.Value)"
+            }
+        }
+    }
+}
+
+function Get-LAPS {
+    Write-Output-And-File "`n[*] LAPS Configuration"
+    Write-Output-And-File "=" * 50
+    $lapsPath = "HKLM:\SOFTWARE\Policies\Microsoft Services\AdmPwd"
+    if (Test-Path $lapsPath) {
+        Get-ItemProperty $lapsPath | ForEach-Object {
+            $_.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" } | ForEach-Object {
+                Write-Output-And-File "$($_.Name): $($_.Value)"
+            }
+        }
+    } else {
+        Write-Output-And-File "LAPS not configured"
+    }
+}
+
+function Get-LastShutdown {
+    Write-Output-And-File "`n[*] Last Shutdown"
+    Write-Output-And-File "=" * 50
+    $shutdownPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Windows"
+    if (Test-Path $shutdownPath) {
+        $shutdownTime = Get-ItemProperty $shutdownPath -Name ShutdownTime -ErrorAction SilentlyContinue
+        if ($shutdownTime) {
+            Write-Output-And-File "Last Shutdown: $([DateTime]::FromFileTime($shutdownTime.ShutdownTime))"
+        }
+    }
+}
+
+function Get-LocalGroups {
+    Write-Output-And-File "`n[*] Local Groups"
+    Write-Output-And-File "=" * 50
+    Get-LocalGroup | ForEach-Object {
+        $group = $_
+        Write-Output-And-File "`nGroup: $($group.Name)"
+        Write-Output-And-File "Description: $($group.Description)"
+        
+        if ($Full -or (Get-LocalGroupMember -Group $group.Name).Count -gt 0) {
+            Get-LocalGroupMember -Group $group.Name -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Output-And-File "  Member: $($_.Name) | Type: $($_.ObjectClass)"
+            }
+        }
+    }
+}
+
+function Get-LocalUsers {
+    Write-Output-And-File "`n[*] Local Users"
+    Write-Output-And-File "=" * 50
+    Get-LocalUser | ForEach-Object {
+        Write-Output-And-File "User: $($_.Name) | Enabled: $($_.Enabled) | PasswordLastSet: $($_.PasswordLastSet)"
+    }
+}
+
+function Get-LSASettings {
+    Write-Output-And-File "`n[*] LSA Settings"
+    Write-Output-And-File "=" * 50
+    $lsaPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+    if (Test-Path $lsaPath) {
+        Get-ItemProperty $lsaPath | ForEach-Object {
+            $_.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" } | ForEach-Object {
+                Write-Output-And-File "$($_.Name): $($_.Value)"
+            }
+        }
+    }
+}
+
+function Get-NamedPipes {
+    Write-Output-And-File "`n[*] Named Pipes"
+    Write-Output-And-File "=" * 50
+    Get-ChildItem \\.\pipe\ | ForEach-Object {
+        Write-Output-And-File "Pipe: $($_.Name)"
+    }
+}
+
+function Get-NetworkProfiles {
+    Write-Output-And-File "`n[*] Network Profiles"
+    Write-Output-And-File "=" * 50
+    Get-NetConnectionProfile | ForEach-Object {
+        Write-Output-And-File "Name: $($_.Name) | InterfaceAlias: $($_.InterfaceAlias) | NetworkCategory: $($_.NetworkCategory)"
+    }
+}
+
+function Get-NetworkShares {
+    Write-Output-And-File "`n[*] Network Shares"
+    Write-Output-And-File "=" * 50
+    Get-WmiObject -Class Win32_Share | ForEach-Object {
+        Write-Output-And-File "Name: $($_.Name) | Path: $($_.Path) | Description: $($_.Description)"
+    }
+}
+
+function Get-NTLMSettings {
+    Write-Output-And-File "`n[*] NTLM Settings"
+    Write-Output-And-File "=" * 50
+    $ntlmPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+    if (Test-Path $ntlmPath) {
+        $ntlmSettings = Get-ItemProperty $ntlmPath
+        Write-Output-And-File "LmCompatibilityLevel: $($ntlmSettings.LmCompatibilityLevel)"
+        Write-Output-And-File "NtlmMinClientSec: $($ntlmSettings.NtlmMinClientSec)"
+        Write-Output-And-File "NtlmMinServerSec: $($ntlmSettings.NtlmMinServerSec)"
+    }
+}
+
+function Get-OSInfo {
+    Write-Output-And-File "`n[*] OS Information"
+    Write-Output-And-File "=" * 50
+    $os = Get-WmiObject Win32_OperatingSystem
+    Write-Output-And-File "Caption: $($os.Caption)"
+    Write-Output-And-File "Version: $($os.Version)"
+    Write-Output-And-File "Build: $($os.BuildNumber)"
+    Write-Output-And-File "Architecture: $($os.OSArchitecture)"
+    Write-Output-And-File "InstallDate: $($os.InstallDate)"
+    Write-Output-And-File "LastBootUpTime: $($os.LastBootUpTime)"
+}
+
+function Get-PowerShellInfo {
+    Write-Output-And-File "`n[*] PowerShell Information"
+    Write-Output-And-File "=" * 50
+    Write-Output-And-File "Version: $($PSVersionTable.PSVersion)"
+    Write-Output-And-File "Edition: $($PSVersionTable.PSEdition)"
+    
+    $executionPolicy = Get-ExecutionPolicy -List
+    $executionPolicy | ForEach-Object {
+        Write-Output-And-File "ExecutionPolicy ($($_.Scope)): $($_.ExecutionPolicy)"
+    }
+}
+
+function Get-Processes {
+    Write-Output-And-File "`n[*] Running Processes"
+    Write-Output-And-File "=" * 50
+    
+    Get-Process | Where-Object {
+        $Full -or ($_.Company -notlike "*Microsoft*")
+    } | ForEach-Object {
+        Write-Output-And-File "Process: $($_.ProcessName) | PID: $($_.Id) | Company: $($_.Company) | Path: $($_.Path)"
+    }
+}
+
+function Get-RDPSettings {
+    Write-Output-And-File "`n[*] RDP Settings"
+    Write-Output-And-File "=" * 50
+    $rdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+    if (Test-Path $rdpPath) {
+        $rdpSettings = Get-ItemProperty $rdpPath
+        Write-Output-And-File "fDenyTSConnections: $($rdpSettings.fDenyTSConnections)"
+    }
+    
+    $rdpPortPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+    if (Test-Path $rdpPortPath) {
+        $portSettings = Get-ItemProperty $rdpPortPath
+        Write-Output-And-File "PortNumber: $($portSettings.PortNumber)"
+    }
+}
+
+function Get-Services {
+    Write-Output-And-File "`n[*] Services"
+    Write-Output-And-File "=" * 50
+    
+    Get-WmiObject Win32_Service | Where-Object {
+        $Full -or ($_.PathName -notlike "*microsoft*")
+    } | ForEach-Object {
+        Write-Output-And-File "Name: $($_.Name) | State: $($_.State) | StartMode: $($_.StartMode) | PathName: $($_.PathName)"
+    }
+}
+
+function Get-Sysmon {
+    Write-Output-And-File "`n[*] Sysmon Configuration"
+    Write-Output-And-File "=" * 50
+    $sysmonPath = "HKLM:\SYSTEM\CurrentControlSet\Services\SysmonDrv\Parameters"
+    if (Test-Path $sysmonPath) {
+        Get-ItemProperty $sysmonPath | ForEach-Object {
+            $_.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" } | ForEach-Object {
+                Write-Output-And-File "$($_.Name): $($_.Value)"
+            }
+        }
+    } else {
+        Write-Output-And-File "Sysmon not installed"
+    }
+}
+
+function Get-TcpConnections {
+    Write-Output-And-File "`n[*] TCP Connections"
+    Write-Output-And-File "=" * 50
+    Get-NetTCPConnection | ForEach-Object {
+        $process = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+        Write-Output-And-File "Local: $($_.LocalAddress):$($_.LocalPort) -> Remote: $($_.RemoteAddress):$($_.RemotePort) | State: $($_.State) | Process: $($process.ProcessName) (PID: $($_.OwningProcess))"
+    }
+}
+
+function Get-TokenPrivileges {
+    Write-Output-And-File "`n[*] Token Privileges"
+    Write-Output-And-File "=" * 50
+    whoami /priv | ForEach-Object { Write-Output-And-File $_ }
+}
+
+function Get-UAC {
+    Write-Output-And-File "`n[*] UAC Settings"
+    Write-Output-And-File "=" * 50
+    $uacPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    if (Test-Path $uacPath) {
+        Get-ItemProperty $uacPath | ForEach-Object {
+            $_.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" } | ForEach-Object {
+                Write-Output-And-File "$($_.Name): $($_.Value)"
+            }
+        }
+    }
+}
+
+function Get-UdpConnections {
+    Write-Output-And-File "`n[*] UDP Connections"
+    Write-Output-And-File "=" * 50
+    Get-NetUDPEndpoint | ForEach-Object {
+        $process = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+        Write-Output-And-File "Local: $($_.LocalAddress):$($_.LocalPort) | Process: $($process.ProcessName) (PID: $($_.OwningProcess))"
+    }
+}
+
+function Get-WindowsAutoLogon {
+    Write-Output-And-File "`n[*] Windows AutoLogon"
+    Write-Output-And-File "=" * 50
+    $autoLogonPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+    if (Test-Path $autoLogonPath) {
+        $autoLogon = Get-ItemProperty $autoLogonPath
+        Write-Output-And-File "AutoAdminLogon: $($autoLogon.AutoAdminLogon)"
+        Write-Output-And-File "DefaultUserName: $($autoLogon.DefaultUserName)"
+        Write-Output-And-File "DefaultDomainName: $($autoLogon.DefaultDomainName)"
+    }
+}
+
+function Get-WindowsDefender {
+    Write-Output-And-File "`n[*] Windows Defender Settings"
+    Write-Output-And-File "=" * 50
+    
+    $defender = Get-MpPreference -ErrorAction SilentlyContinue
+    if ($defender) {
+        Write-Output-And-File "DisableRealtimeMonitoring: $($defender.DisableRealtimeMonitoring)"
+        Write-Output-And-File "DisableBehaviorMonitoring: $($defender.DisableBehaviorMonitoring)"
+        Write-Output-And-File "DisableIOAVProtection: $($defender.DisableIOAVProtection)"
+        Write-Output-And-File "`nExclusion Paths:"
+        $defender.ExclusionPath | ForEach-Object { Write-Output-And-File "  $_" }
+        Write-Output-And-File "`nExclusion Extensions:"
+        $defender.ExclusionExtension | ForEach-Object { Write-Output-And-File "  $_" }
+    }
+}
+
+function Get-WindowsFirewall {
+    Write-Output-And-File "`n[*] Windows Firewall Rules"
+    Write-Output-And-File "=" * 50
+    
+    Get-NetFirewallRule | Where-Object {
+        $Full -or ($_.DisplayName -notlike "*Microsoft*" -and $_.DisplayName -notlike "*Windows*")
+    } | ForEach-Object {
+        Write-Output-And-File "Name: $($_.DisplayName) | Direction: $($_.Direction) | Action: $($_.Action) | Enabled: $($_.Enabled)"
+    }
+}
+
+#endregion
+
+#region User Group
+
+function Get-ChromiumPresence {
+    Write-Output-And-File "`n[*] Chromium Browser Presence"
+    Write-Output-And-File "=" * 50
+    
+    $chromiumPaths = @(
+        "$env:LOCALAPPDATA\Google\Chrome\User Data",
+        "$env:LOCALAPPDATA\Microsoft\Edge\User Data",
+        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"
+    )
+    
+    foreach ($path in $chromiumPaths) {
+        if (Test-Path $path) {
+            Write-Output-And-File "Found: $path"
+        }
+    }
+}
+
+function Get-CloudCredentials {
+    Write-Output-And-File "`n[*] Cloud Credentials"
+    Write-Output-And-File "=" * 50
+    
+    $cloudPaths = @(
+        "$env:USERPROFILE\.aws\credentials",
+        "$env:USERPROFILE\.azure\credentials",
+        "$env:APPDATA\gcloud\credentials.db"
+    )
+    
+    foreach ($path in $cloudPaths) {
+        if (Test-Path $path) {
+            Write-Output-And-File "Found: $path"
+        }
+    }
+}
+
+function Get-ExplorerMRUs {
+    Write-Output-And-File "`n[*] Explorer MRUs"
+    Write-Output-And-File "=" * 50
+    $mruPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
+    if (Test-Path $mruPath) {
+        Get-ChildItem $mruPath | ForEach-Object {
+            Write-Output-And-File "Extension: $($_.PSChildName)"
+        }
+    }
+}
+
+function Get-IEUrls {
+    Write-Output-And-File "`n[*] Internet Explorer Typed URLs"
+    Write-Output-And-File "=" * 50
+    $iePath = "HKCU:\Software\Microsoft\Internet Explorer\TypedURLs"
+    if (Test-Path $iePath) {
+        Get-ItemProperty $iePath | ForEach-Object {
+            $_.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" } | ForEach-Object {
+                Write-Output-And-File "$($_.Name): $($_.Value)"
+            }
+        }
+    }
+}
+
+function Get-MappedDrives {
+    Write-Output-And-File "`n[*] Mapped Drives"
+    Write-Output-And-File "=" * 50
+    Get-PSDrive -PSProvider FileSystem | Where-Object { $_.DisplayRoot } | ForEach-Object {
+        Write-Output-And-File "Drive: $($_.Name): -> $($_.DisplayRoot)"
+    }
+}
+
+function Get-PowerShellHistory {
+    Write-Output-And-File "`n[*] PowerShell History"
+    Write-Output-And-File "=" * 50
+    
+    $historyPath = "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+    if (Test-Path $historyPath) {
+        Write-Output-And-File "Current User History:"
+        Get-Content $historyPath | ForEach-Object {
+            Write-Output-And-File "  $_"
+        }
+    }
+    
+    # Check all users if elevated
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($isAdmin) {
+        Get-ChildItem "C:\Users\*\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Output-And-File "`nUser: $($_.DirectoryName)"
+            Get-Content $_.FullName | ForEach-Object {
+                Write-Output-And-File "  $_"
+            }
+        }
+    }
+}
+
+function Get-RDPSavedConnections {
+    Write-Output-And-File "`n[*] Saved RDP Connections"
+    Write-Output-And-File "=" * 50
+    $rdpPath = "HKCU:\Software\Microsoft\Terminal Server Client\Servers"
+    if (Test-Path $rdpPath) {
+        Get-ChildItem $rdpPath | ForEach-Object {
+            Write-Output-And-File "Server: $($_.PSChildName)"
+        }
+    }
+}
+
+function Get-TokenGroups {
+    Write-Output-And-File "`n[*] Token Groups"
+    Write-Output-And-File "=" * 50
+    whoami /groups | ForEach-Object { Write-Output-And-File $_ }
+}
+
+#endregion
+
+#region Misc Group
+
+function Get-InstalledProducts {
+    Write-Output-And-File "`n[*] Installed Products"
+    Write-Output-And-File "=" * 50
+    
+    $uninstallPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    
+    foreach ($path in $uninstallPaths) {
+        Get-ItemProperty $path -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object {
+            Write-Output-And-File "Product: $($_.DisplayName) | Version: $($_.DisplayVersion) | Publisher: $($_.Publisher)"
+        }
+    }
+}
+
+function Get-ScheduledTasks {
+    Write-Output-And-File "`n[*] Scheduled Tasks"
+    Write-Output-And-File "=" * 50
+    
+    Get-ScheduledTask | Where-Object {
+        $Full -or ($_.Author -notlike "*Microsoft*")
+    } | ForEach-Object {
+        Write-Output-And-File "Task: $($_.TaskName) | State: $($_.State) | Author: $($_.Author)"
+    }
+}
+
+#endregion
+
+# Main execution
+try {
+    Get-Banner
+    
+    Write-Output-And-File "`n`n========== SYSTEM GROUP =========="
+    Get-AMSIProviders
+    Get-AntiVirus
+    Get-AppLockerPolicy
+    Get-ARPTable
+    Get-AuditPolicies
+    Get-AutoRuns
+    Get-Certificates
+    Get-CredGuard
+    Get-DNSCache
+    Get-DotNetVersions
+    Get-EnvironmentPath
+    Get-EnvironmentVariables
+    Get-Hotfixes
+    Get-InterestingProcesses
+    Get-InternetSettings
+    Get-LAPS
+    Get-LastShutdown
+    Get-LocalGroups
+    Get-LocalUsers
+    Get-LSASettings
+    Get-NamedPipes
+    Get-NetworkProfiles
+    Get-NetworkShares
+    Get-NTLMSettings
+    Get-OSInfo
+    Get-PowerShellInfo
+    Get-Processes
+    Get-RDPSettings
+    Get-Services
+    Get-Sysmon
+    Get-TcpConnections
+    Get-TokenPrivileges
+    Get-UAC
+    Get-UdpConnections
+    Get-WindowsAutoLogon
+    Get-WindowsDefender
+    Get-WindowsFirewall
+    
+    Write-Output-And-File "`n`n========== USER GROUP =========="
+    Get-ChromiumPresence
+    Get-CloudCredentials
+    Get-ExplorerMRUs
+    Get-IEUrls
+    Get-MappedDrives
+    Get-PowerShellHistory
+    Get-RDPSavedConnections
+    Get-TokenGroups
+    
+    Write-Output-And-File "`n`n========== MISC GROUP =========="
