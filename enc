@@ -1,0 +1,135 @@
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$FilePath
+)
+
+# Hardcoded key (as requested)
+$HardcodedKey = "Encrypt93"
+
+# Constants
+$BufferSize = 1MB  # Process in 1MB chunks to handle large files
+$SaltBytes = 32    # 256-bit salt
+$IVBytes = 16      # 128-bit IV for AES
+$Iterations = 10000
+
+function DeriveKeyAndIV {
+    param([string]$Password, [byte[]]$Salt)
+    $keyGen = New-Object Security.Cryptography.Rfc2898DeriveBytes($Password, $Salt, $Iterations, [Security.Cryptography.HashAlgorithmName]::SHA256)
+    $key = $keyGen.GetBytes(32)  # AES-256 key
+    $iv = $keyGen.GetBytes(16)   # AES block size = 16 bytes
+    return $key, $iv
+}
+
+function Encrypt-File {
+    param([string]$InputPath, [string]$OutputPath)
+    try {
+        $salt = New-Object byte[] $SaltBytes
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        $rng.GetBytes($salt)
+
+        $key, $iv = DeriveKeyAndIV -Password $HardcodedKey -Salt $salt
+
+        $aes = [Security.Cryptography.Aes]::Create()
+        $aes.Key = $key
+        $aes.IV = $iv
+        $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+
+        $encryptor = $aes.CreateEncryptor()
+        $cryptoStream = New-Object Security.Cryptography.CryptoStream([System.IO.File]::OpenWrite($OutputPath), $encryptor, [Security.Cryptography.CryptoStreamMode]::Write)
+
+        # Write salt first (needed for decryption)
+        $cryptoStream.Write($salt, 0, $salt.Length)
+
+        $inputStream = [System.IO.File]::OpenRead($InputPath)
+        $buffer = New-Object byte[] $BufferSize
+        while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $cryptoStream.Write($buffer, 0, $read)
+        }
+        $inputStream.Close()
+        $cryptoStream.Close()
+        $aes.Dispose()
+        Write-Host "✅ Encrypted: $InputPath -> $OutputPath" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Encryption failed: $_"
+        exit 1
+    }
+}
+
+function Decrypt-File {
+    param([string]$InputPath, [string]$OutputPath)
+    try {
+        $inputStream = [System.IO.File]::OpenRead($InputPath)
+        
+        # Read salt first
+        $salt = New-Object byte[] $SaltBytes
+        if ($inputStream.Read($salt, 0, $salt.Length) -ne $SaltBytes) {
+            throw "Invalid encrypted file: missing salt"
+        }
+
+        $key, $iv = DeriveKeyAndIV -Password $HardcodedKey -Salt $salt
+
+        $aes = [Security.Cryptography.Aes]::Create()
+        $aes.Key = $key
+        $aes.IV = $iv
+        $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+
+        $decryptor = $aes.CreateDecryptor()
+        $cryptoStream = New-Object Security.Cryptography.CryptoStream($inputStream, $decryptor, [Security.Cryptography.CryptoStreamMode]::Read)
+        $outputStream = [System.IO.File]::OpenWrite($OutputPath)
+
+        $buffer = New-Object byte[] $BufferSize
+        while (($read = $cryptoStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $outputStream.Write($buffer, 0, $read)
+        }
+
+        $outputStream.Close()
+        $cryptoStream.Close()
+        $inputStream.Close()
+        $aes.Dispose()
+        Write-Host "✅ Decrypted: $InputPath -> $OutputPath" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Decryption failed: $_"
+        exit 1
+    }
+}
+
+# === MAIN LOGIC ===
+$FullPath = Resolve-Path -Path $FilePath -ErrorAction Stop
+
+if (-not (Test-Path $FullPath)) {
+    Write-Error "File not found: $FullPath"
+    exit 1
+}
+
+$Extension = [System.IO.Path]::GetExtension($FullPath).ToLower()
+$FileNameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($FullPath)
+$Directory = [System.IO.Path]::GetDirectoryName($FullPath)
+
+if ($Extension -eq ".encrypted") {
+    # Decrypt
+    $OriginalExtFile = Join-Path $Directory ($FileNameWithoutExt)  # e.g., document.pdf
+    if (Test-Path $OriginalExtFile) {
+        $choice = Read-Host "⚠️  Output file '$OriginalExtFile' already exists. Overwrite? (y/n)"
+        if ($choice -notlike "y*") {
+            Write-Host "Operation cancelled." -ForegroundColor Yellow
+            exit 0
+        }
+    }
+    Decrypt-File -InputPath $FullPath -OutputPath $OriginalExtFile
+}
+else {
+    # Encrypt
+    $EncryptedFile = Join-Path $Directory ($FileNameWithoutExt + ".encrypted")
+    if (Test-Path $EncryptedFile) {
+        $choice = Read-Host "⚠️  Encrypted file '$EncryptedFile' already exists. Overwrite? (y/n)"
+        if ($choice -notlike "y*") {
+            Write-Host "Operation cancelled." -ForegroundColor Yellow
+            exit 0
+        }
+    }
+    Encrypt-File -InputPath $FullPath -OutputPath $EncryptedFile
+}
