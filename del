@@ -1,0 +1,80 @@
+<#
+.SYNOPSIS
+    Cleans up PowerShell execution traces for a standard user and self-deletes.
+.DESCRIPTION
+    - Clears current session history
+    - Deletes PSReadLine command history file
+    - Removes PowerShell transcript logs from common user locations
+    - Overwrites and deletes this script file after execution
+    - Runs without admin privileges
+.NOTES
+    Designed for test environments. Safe for regular user accounts.
+#>
+
+# --- 1. Clear in-memory command history (current session only) ---
+Clear-History -ErrorAction SilentlyContinue
+
+# --- 2. Delete PSReadLine history file ---
+$historyFile = "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+if (Test-Path $historyFile) {
+    try {
+        Remove-Item $historyFile -Force
+        Write-Host "[+] Deleted PowerShell command history file." -ForegroundColor Green
+    } catch {
+        Write-Host "[-] Could not delete history file: $_" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "[*] No PowerShell history file found." -ForegroundColor Gray
+}
+
+# --- 3. Delete transcript logs (common user locations) ---
+$transcriptLocations = @(
+    "$env:USERPROFILE\Documents",
+    "$env:TEMP",
+    "$env:USERPROFILE\Desktop"
+)
+
+$deletedAny = $false
+foreach ($location in $transcriptLocations) {
+    if (-not (Test-Path $location)) { continue }
+    $transcripts = Get-ChildItem -Path $location -Filter "*PowerShell_transcript*.txt" -ErrorAction SilentlyContinue
+    foreach ($log in $transcripts) {
+        try {
+            Remove-Item $log.FullName -Force
+            Write-Host "[+] Deleted transcript: $($log.Name)" -ForegroundColor Green
+            $deletedAny = $true
+        } catch {
+            Write-Host "[-] Failed to delete transcript: $($log.Name)" -ForegroundColor Yellow
+        }
+    }
+}
+if (-not $deletedAny) {
+    Write-Host "[*] No transcript logs found." -ForegroundColor Gray
+}
+
+# --- 4. Self-destruct: overwrite and delete this script ---
+$scriptPath = $MyInvocation.MyCommand.Path
+if ($scriptPath -and (Test-Path $scriptPath)) {
+    try {
+        # Overwrite content with zeros (basic secure erase)
+        $contentLength = (Get-Item $scriptPath).Length
+        if ($contentLength -gt 0) {
+            $zeroBuffer = New-Object byte[] $contentLength
+            [System.IO.File]::WriteAllBytes($scriptPath, $zeroBuffer)
+        }
+        # Delete the file
+        Remove-Item $scriptPath -Force
+        Write-Host "[+] Script securely self-deleted." -ForegroundColor Cyan
+    } catch {
+        # Fallback: try normal delete if overwrite fails (e.g., on some systems)
+        try {
+            Remove-Item $scriptPath -Force
+            Write-Host "[+] Script self-deleted (standard method)." -ForegroundColor Cyan
+        } catch {
+            Write-Host "[-] Could not self-delete script. Delete manually: $scriptPath" -ForegroundColor Red
+        }
+    }
+}
+
+Write-Host "`n[✓] User-level cleanup complete. All removable traces deleted." -ForegroundColor Magenta
+Write-Host "Note: System logs (Event Viewer) were NOT cleared (admin required)." -ForegroundColor DarkGray
